@@ -4,7 +4,7 @@ import {
   applyHostStyleVariables,
 } from '@modelcontextprotocol/ext-apps';
 
-const app = new App({ name: 'Colab Pilot', version: '1.1.3' }, {});
+const app = new App({ name: 'Colab Pilot', version: '1.2.0' }, {});
 let currentState = null;
 let busyAction = '';
 let receivedInitialResult = false;
@@ -90,6 +90,8 @@ function render(data) {
 
   const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
   const jobs = Array.isArray(data?.jobs) ? data.jobs : [];
+  const transfers = Array.isArray(data?.transfers) ? data.transfers : [];
+  const keepalive = data?.keepalive || {};
   const activeOps = Array.isArray(data?.active_operations) ? data.active_operations : [];
   const alarm = data?.alarm || {};
   const caps = app.getHostCapabilities() || {};
@@ -192,6 +194,41 @@ function render(data) {
         .join('')
     : `<div class="empty">No detached jobs tracked yet.</div>`;
 
+  const transferSection = transfers.length
+    ? `
+      <section class="sec">
+        <div class="sec-hdr">
+          <h2>Background Transfers (${transfers.length})</h2>
+        </div>
+        ${transfers
+          .map((t) => {
+            const st = String(t.state || 'unknown');
+            const pct = t.percent != null ? `${Number(t.percent).toFixed(1)}%` : '—';
+            const pillCls = st === 'completed' ? 'pill-ok' : st === 'failed' ? 'pill-err' : 'pill-info';
+            return `
+              <div class="card">
+                <div class="card-head">
+                  <div>
+                    <div class="card-title">${esc(t.transfer_id || t.job_id)} <span class="muted">${esc(t.phase || '')}</span></div>
+                    <div class="card-sub">${esc(t.drive_target || '')} · ${pct}</div>
+                  </div>
+                  <span class="pill ${pillCls}">${esc(st)}</span>
+                </div>
+                <div class="btn-row">
+                  <button class="btn" data-action="poll-job" data-session="${esc(t.session || '')}" data-job="${esc(t.transfer_id || t.job_id)}">Poll Transfer</button>
+                </div>
+              </div>
+            `;
+          })
+          .join('')}
+      </section>
+    `
+    : '';
+
+  const keepaliveBadge = keepalive.running
+    ? `<span class="pill pill-info">Keepalive PID ${esc(keepalive.pid)}</span>`
+    : `<span class="pill pill-muted">Keepalive Idle</span>`;
+
   root.innerHTML = `
     <div class="wrap">
       <header class="hdr">
@@ -224,6 +261,7 @@ function render(data) {
       </section>
 
       ${opsSection}
+      ${transferSection}
 
       <section class="sec">
         <div class="sec-hdr">
@@ -244,6 +282,7 @@ function render(data) {
         <div>
           <strong>Wakeup Alarm:</strong>
           <span class="pill ${alarm.running ? 'pill-warn' : 'pill-muted'}">${alarm.running ? 'ACTIVE' : 'Idle'}</span>
+          ${keepaliveBadge}
         </div>
         <div class="btn-row">
           <button class="btn" data-action="alarm-test">Test Chirp</button>
@@ -317,7 +356,8 @@ async function init() {
     const hasActivity =
       (currentState.active_operations || []).length > 0 ||
       Number(currentState.usage?.active_assignments || 0) > 0 ||
-      (currentState.jobs || []).some((j) => j.state === 'running');
+      (currentState.jobs || []).some((j) => j.state === 'running') ||
+      (currentState.transfers || []).some((t) => t.state === 'running');
     if (hasActivity) {
       runTool('colab_dashboard', {}, 'Auto-refresh');
     }

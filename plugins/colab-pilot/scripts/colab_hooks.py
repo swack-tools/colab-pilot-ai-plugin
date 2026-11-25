@@ -65,13 +65,14 @@ def _active_leases() -> dict[str, dict]:
 
 
 def _active_detached_sessions() -> set[str]:
-    raw = _read_json(_data_dir() / "detached_jobs.json", {})
-    if not isinstance(raw, dict):
-        return set()
     out: set[str] = set()
-    for job in raw.values():
-        if isinstance(job, dict) and job.get("state") in {"running", "starting"} and job.get("session"):
-            out.add(str(job["session"]))
+    for fname in ("detached_jobs.json", "transfer_jobs.json"):
+        raw = _read_json(_data_dir() / fname, {})
+        if not isinstance(raw, dict):
+            continue
+        for job in raw.values():
+            if isinstance(job, dict) and job.get("state") in {"running", "starting"} and job.get("session"):
+                out.add(str(job["session"]))
     return out
 
 

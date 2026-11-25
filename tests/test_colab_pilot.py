@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -280,6 +281,278 @@ class ColabPilotTests(unittest.TestCase):
         c2 = pkg.build_release(d2)
         self.assertEqual(c1, c2)
         self.assertEqual((d1 / "SHA256SUMS").read_text(), (d2 / "SHA256SUMS").read_text())
+
+    def test_async_drive_stage_transfer_and_concurrent_dashboard(self) -> None:
+        rclone_conf = self.home_dir / ".config" / "rclone" / "colab_gdrive_root.conf"
+        rclone_conf.parent.mkdir(parents=True, exist_ok=True)
+        rclone_conf.write_text("[gdrive_root]\ntype = drive\n", encoding="utf-8")
+
+        fake_bin = self.tmp_path / "fake_rclone_bin"
+        fake_bin.mkdir()
+        rclone_bin = fake_bin / "rclone"
+        rclone_bin.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys, time\n"
+            "print(json.dumps({'stats': {'bytes': 512, 'totalBytes': 1024, 'speed': 512}}), flush=True)\n"
+            "time.sleep(1.2)\n"
+            "print(json.dumps({'stats': {'bytes': 1024, 'totalBytes': 1024, 'speed': 1024}}), flush=True)\n",
+            encoding="utf-8",
+        )
+        rclone_bin.chmod(0o755)
+
+        payload_file = self.tmp_path / "dataset.tar"
+        payload_file.write_bytes(b"x" * 1024)
+
+        env = dict(self.env)
+        env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+
+        proc = subprocess.Popen(
+            [sys.executable, "-B", str(SCRIPTS_DIR / "colab_mcp_server.py"), "--data-dir", str(self.data_dir)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        try:
+            assert proc.stdin is not None and proc.stdout is not None
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}}) + "\n")
+            proc.stdin.flush()
+            self.assertEqual(json.loads(proc.stdout.readline())["id"], 1)
+
+            t0 = time.monotonic()
+            proc.stdin.write(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "colab_smart_transfer",
+                            "arguments": {
+                                "direction": "upload",
+                                "mode": "drive_stage",
+                                "local_path": str(payload_file),
+                                "remote_path": "/content/dataset.tar",
+                                "async_transfer": True,
+                            },
+                        },
+                    }
+                )
+                + "\n"
+            )
+            proc.stdin.flush()
+            xfer_resp = json.loads(proc.stdout.readline())["result"]["structuredContent"]
+            self.assertLess(time.monotonic() - t0, 1.0)
+            self.assertEqual(xfer_resp["state"], "running")
+            xfer_id = xfer_resp["transfer_id"]
+
+            t_dash = time.monotonic()
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "colab_dashboard", "arguments": {}}}) + "\n")
+            proc.stdin.flush()
+            dash_resp = json.loads(proc.stdout.readline())["result"]["structuredContent"]
+            self.assertLess(time.monotonic() - t_dash, 2.0)
+            self.assertTrue(any(t["transfer_id"] == xfer_id for t in dash_resp["transfers"]))
+
+            deadline = time.monotonic() + 5.0
+            final_state = "running"
+            while time.monotonic() < deadline:
+                proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "colab_poll_job", "arguments": {"job_id": xfer_id}}}) + "\n")
+                proc.stdin.flush()
+                poll_resp = json.loads(proc.stdout.readline())["result"]["structuredContent"]
+                final_state = poll_resp.get("state", "running")
+                if final_state == "completed":
+                    break
+                time.sleep(0.25)
+            self.assertEqual(final_state, "completed")
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+
+    def test_allocate_cascade_wall_clock_budget_and_400_fast_skip(self) -> None:
+        mcp = _load_module("colab_mcp_server", SCRIPTS_DIR / "colab_mcp_server.py")
+        self.assertLessEqual(mcp.MAX_CASCADE_BUDGET_SEC, 145.0)
+        self.assertLessEqual(mcp.DEFAULT_CASCADE_TIER_TIMEOUT_SEC, 28.0)
+
+        fake_colab = self.tmp_path / "cascade_colab"
+        fake_colab.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, time\n"
+            "args = sys.argv[1:]\n"
+            "if 'new' in args:\n"
+            "    if 'H100' in args:\n"
+            "        sys.stderr.write(\"[colab] Backend rejected accelerator 'H100' (HTTP 400)\\n\")\n"
+            "        sys.exit(1)\n"
+            "    time.sleep(20)\n"
+            "elif 'stop' in args:\n"
+            "    print('stopped')\n",
+            encoding="utf-8",
+        )
+        fake_colab.chmod(0o755)
+        old_env = {k: os.environ.get(k) for k in ("COLAB_BIN", "COLAB_CASCADE_TIER_TIMEOUT_SEC")}
+        os.environ["COLAB_BIN"] = str(fake_colab)
+        os.environ["COLAB_CASCADE_TIER_TIMEOUT_SEC"] = "1.5"
+        try:
+            t0 = time.monotonic()
+            with self.assertRaises(RuntimeError) as ctx:
+                mcp.tool_colab_allocate_cascade(
+                    self.data_dir,
+                    {"session": "s1", "tiers": ["H100", "A100", "L4"], "max_wall_seconds": 5.0},
+                )
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 6.5)
+            msg = str(ctx.exception)
+            self.assertIn('"rejected": true', msg)
+            self.assertIn('"timed_out": true', msg)
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_keepalive_daemon_idempotent_pings_autostop_and_exit(self) -> None:
+        mcp = _load_module("colab_mcp_server", SCRIPTS_DIR / "colab_mcp_server.py")
+        log_path = self.tmp_path / "ka_calls.log"
+        fake_colab = self.tmp_path / "ka_colab"
+        status_src = self.tmp_path / "remote_status.json"
+        status_src.write_text(json.dumps({"job_id": "job-ka", "state": "completed", "exit_code": 0}), encoding="utf-8")
+
+        fake_colab.write_text(
+            f"""#!/usr/bin/env python3
+import shutil, sys
+args = sys.argv[1:]
+with open({str(log_path)!r}, "a") as f:
+    f.write(" ".join(args) + "\\n")
+if args and args[0] == "download":
+    shutil.copyfile({str(status_src)!r}, args[-1])
+""",
+            encoding="utf-8",
+        )
+        fake_colab.chmod(0o755)
+
+        sess_file = self.home_dir / ".config" / "colab-cli" / "sessions.json"
+        sess_file.parent.mkdir(parents=True, exist_ok=True)
+        sess_file.write_text(json.dumps({"ka-vm": {"name": "ka-vm"}}), encoding="utf-8")
+
+        old_env = {k: os.environ.get(k) for k in ("HOME", "COLAB_BIN", "COLAB_KEEPALIVE_INTERVAL_SEC")}
+        os.environ["HOME"] = str(self.home_dir)
+        os.environ["COLAB_BIN"] = str(fake_colab)
+        os.environ["COLAB_KEEPALIVE_INTERVAL_SEC"] = "0.2"
+        pid = 0
+        try:
+            r1 = mcp.tool_colab_keep_warm(self.data_dir, {"session": "ka-vm", "minutes": 0.03})["structuredContent"]
+            r2 = mcp.tool_colab_keep_warm(self.data_dir, {"session": "ka-vm", "minutes": 0.03})["structuredContent"]
+            pid = int(r1["keepalive_pid"])
+            self.assertEqual(pid, int(r2["keepalive_pid"]))
+
+            # Register a completed detached job with auto_stop_vm=True, then clear lease so reaper triggers stop
+            mcp._write_json(
+                self.data_dir / "detached_jobs.json",
+                {"job-ka": {"job_id": "job-ka", "session": "ka-vm", "state": "running", "auto_stop_vm": True, "started_at": time.time()}},
+            )
+            time.sleep(0.7)
+            mcp.tool_colab_keep_warm(self.data_dir, {"session": "ka-vm", "clear": True})
+
+            deadline = time.monotonic() + 5.0
+            stopped_ok = False
+            exited_ok = False
+            while time.monotonic() < deadline:
+                calls = log_path.read_text(encoding="utf-8") if log_path.is_file() else ""
+                jobs = mcp._read_json(self.data_dir / "detached_jobs.json", {})
+                if "stop -s ka-vm" in calls and jobs.get("job-ka", {}).get("vm_auto_stopped"):
+                    stopped_ok = True
+                if not (self.data_dir / "keepalive_daemon.json").exists():
+                    exited_ok = True
+                if stopped_ok and exited_ok:
+                    break
+                time.sleep(0.15)
+
+            calls = log_path.read_text(encoding="utf-8")
+            self.assertIn("ls -s ka-vm content", calls)
+            self.assertIn("exec -s ka-vm", calls)
+            self.assertTrue(stopped_ok, f"Expected auto_stop_vm to run stop; calls={calls!r}")
+            self.assertTrue(exited_ok, "Expected keepalive daemon to self-terminate after leases & jobs cleared")
+        finally:
+            if pid > 0:
+                try:
+                    os.kill(pid, 15)
+                except OSError:
+                    pass
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_detached_wrapper_incremental_drive_checkpoint_mirroring(self) -> None:
+        mcp = _load_module("colab_mcp_server", SCRIPTS_DIR / "colab_mcp_server.py")
+        wrapper_path = self.tmp_path / "_wrapper.py"
+        wrapper_path.write_text(mcp.build_detached_wrapper_source(), encoding="utf-8")
+
+        sync_dir = self.tmp_path / "out"
+        sync_dir.mkdir()
+        job_dir = self.tmp_path / "job"
+        job_dir.mkdir()
+
+        fake_bin = self.tmp_path / "rclone_wrap_bin"
+        fake_bin.mkdir()
+        rclone_log = self.tmp_path / "rclone_sync.log"
+        rclone_bin = fake_bin / "rclone"
+        rclone_bin.write_text(
+            f"""#!/usr/bin/env python3
+import sys
+with open({str(rclone_log)!r}, "a") as f:
+    f.write(" ".join(sys.argv[1:]) + "\\n")
+""",
+            encoding="utf-8",
+        )
+        rclone_bin.chmod(0o755)
+
+        rclone_conf = self.tmp_path / "rclone.conf"
+        rclone_conf.write_text("[gdrive_root]\ntype = drive\n", encoding="utf-8")
+        train_script = self.tmp_path / "train.py"
+        train_script.write_text(
+            f"from pathlib import Path\n"
+            f"(Path({str(sync_dir)!r}) / 'best.pt').write_bytes(b'weights')\n"
+            f"(Path({str(sync_dir)!r}) / 'skip.bin').write_bytes(b'ignored')\n"
+            f"print('done')\n",
+            encoding="utf-8",
+        )
+        wrap_env = dict(self.env)
+        wrap_env["PATH"] = f"{fake_bin}:{wrap_env.get('PATH', '')}"
+        wrap_env["RCLONE_CONFIG"] = str(rclone_conf)
+        res = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(wrapper_path),
+                str(job_dir),
+                str(train_script),
+                "[]",
+                "job-sync",
+                str(sync_dir),
+                "gdrive_root:ckpts/run1",
+                json.dumps(["*.pt", "*.json"]),
+            ],
+            capture_output=True,
+            text=True,
+            env=wrap_env,
+            timeout=20,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        st = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
+        self.assertEqual(st["state"], "completed")
+        self.assertEqual(st["exit_code"], 0)
+        self.assertIsNotNone(st["last_drive_sync_ts"])
+        self.assertEqual(st["synced_file_count"], 1)
+        rc_calls = rclone_log.read_text(encoding="utf-8")
+        self.assertIn("copy ", rc_calls)
+        self.assertIn("--include *.pt", rc_calls)
+        self.assertIn("copyto ", rc_calls)
 
 
 if __name__ == "__main__":
