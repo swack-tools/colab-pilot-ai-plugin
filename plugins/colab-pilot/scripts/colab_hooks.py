@@ -221,9 +221,14 @@ def _check_colab_args(args: list[str], raw_segment: str, full_cmd: str) -> str |
 
 def handle_pre_tool_use(payload: dict) -> dict:
     tool_call = payload.get("toolCall") or {}
-    if tool_call.get("name") != "run_command":
-        return {"decision": "allow"}
-    cmd = str((tool_call.get("args") or {}).get("CommandLine") or "")
+    if tool_call:
+        if tool_call.get("name") != "run_command":
+            return {"decision": "allow"}
+        cmd = str((tool_call.get("args") or {}).get("CommandLine") or "")
+    else:
+        if payload.get("tool_name") != "Bash":
+            return {"decision": "allow"}
+        cmd = str((payload.get("tool_input") or {}).get("command") or "")
     if "colab" not in cmd:
         return {"decision": "allow"}
 
@@ -240,9 +245,9 @@ def handle_pre_tool_use(payload: dict) -> dict:
 
 
 def handle_stop(payload: dict) -> dict:
-    if payload.get("terminationReason") != "NO_TOOL_CALL":
+    if payload.get("terminationReason") and payload.get("terminationReason") != "NO_TOOL_CALL":
         return {"decision": "stop"}
-    if not payload.get("fullyIdle", True) or payload.get("continuationActive", False):
+    if not payload.get("fullyIdle", True) or payload.get("continuationActive", False) or payload.get("stop_hook_active", False):
         return {"decision": "stop"}
 
     sessions = _read_json(_sessions_file(), {})

@@ -30,7 +30,7 @@ jobs:
       - name: Resolve and verify release version
         id: meta
         run: |
-          VERSION="$(python3 -c 'import json; print(json.load(open("plugins/colab-pilot/plugin.json"))["version"])')"
+          VERSION="$(python3 -c 'import json; print(json.load(open("plugins/colab-pilot/.antigravity-plugin/plugin.json"))["version"])')"
           if [ "${{ github.ref_type }}" = "tag" ]; then
             TAG="${{ github.ref_name }}"
           elif [ -n "${{ inputs.tag }}" ]; then

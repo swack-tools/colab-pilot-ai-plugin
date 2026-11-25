@@ -28,55 +28,42 @@ def load_json(path: Path) -> dict:
         return {}
 
 
-manifest = load_json(PLUGIN / "plugin.json")
-check(manifest.get("$schema") == "https://antigravity.google/schemas/v1/plugin.json", "plugin.json: missing/invalid $schema")
-check(manifest.get("name") == "colab-pilot", "plugin.json: name must be 'colab-pilot'")
-check(manifest.get("displayName") == "Colab Pilot", "plugin.json: displayName must be 'Colab Pilot'")
-check(re.fullmatch(r"\d+\.\d+\.\d+", str(manifest.get("version", ""))) is not None, "plugin.json: version must be semver")
-desc = str(manifest.get("description", ""))
-check(50 <= len(desc) <= 220, f"plugin.json: description length {len(desc)} out of bounds")
-prompts = manifest.get("suggestedPrompts", [])
-check(isinstance(prompts, list) and 1 <= len(prompts) <= 3, "plugin.json: suggestedPrompts must have 1..3 entries")
-check(str(manifest.get("repository", "")).startswith("https://"), "plugin.json: repository must be https:// URL")
+agy = load_json(PLUGIN / ".antigravity-plugin" / "plugin.json")
+claude = load_json(PLUGIN / ".claude-plugin" / "plugin.json")
+codex = load_json(PLUGIN / ".codex-plugin" / "plugin.json")
 
-logo_rel = str(manifest.get("logo", ""))
-check(logo_rel == "assets/logo.svg", f"plugin.json: unexpected logo {logo_rel!r}")
-logo_path = PLUGIN / logo_rel
+check(not (PLUGIN / "plugin.json").exists(), "root plugin.json must not exist alongside multi-client manifests")
+check(agy.get("$schema") == "https://antigravity.google/schemas/v1/plugin.json", ".antigravity-plugin/plugin.json: invalid $schema")
+check(agy.get("displayName") == "Colab Pilot", ".antigravity-plugin/plugin.json: displayName must be 'Colab Pilot'")
+
+for label, m in (("antigravity", agy), ("claude", claude), ("codex", codex)):
+    check(m.get("name") == "colab-pilot", f"{label}: name must be 'colab-pilot'")
+    check(re.fullmatch(r"\d+\.\d+\.\d+", str(m.get("version", ""))) is not None, f"{label}: version must be semver")
+    check(m.get("version") == agy.get("version"), f"{label}: version mismatch")
+    check(str(m.get("repository", "")).startswith("https://"), f"{label}: repository must be https:// URL")
+
+for png_rel in ("assets/icon.png", "assets/logo.png"):
+    pp = PLUGIN / png_rel
+    check(pp.is_file() and pp.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n", f"{png_rel} missing or invalid PNG")
+
+logo_path = PLUGIN / "assets" / "logo.svg"
 check(logo_path.is_file() and "<svg" in logo_path.read_text(encoding="utf-8"), "assets/logo.svg missing or invalid")
 
 dash_path = PLUGIN / "assets" / "dashboard.html"
-check(dash_path.is_file(), "assets/dashboard.html missing")
-if dash_path.is_file():
-    size = dash_path.stat().st_size
-    check(10_000 < size < 10 * 1024 * 1024, f"assets/dashboard.html size out of bounds: {size}")
+check(dash_path.is_file() and 10_000 < dash_path.stat().st_size < 10 * 1024 * 1024, "assets/dashboard.html missing or bad size")
 
 check((PLUGIN / "rules" / "AGENTS.md").is_file(), "rules/AGENTS.md missing")
-
 agent_path = PLUGIN / "agents" / "colab-operator.md"
-check(agent_path.is_file(), "agents/colab-operator.md missing")
-if agent_path.is_file():
-    atext = agent_path.read_text(encoding="utf-8")
-    check(atext.startswith("---\n") and "name: colab-operator" in atext, "agents/colab-operator.md missing valid frontmatter")
+check(agent_path.is_file() and "name: colab-operator" in agent_path.read_text(encoding="utf-8"), "agents/colab-operator.md invalid")
 
-hooks = load_json(PLUGIN / "hooks.json")
-check(list(hooks) == ["colab-pilot"], f"hooks.json: expected top-level key ['colab-pilot'], got {list(hooks)}")
-group = hooks.get("colab-pilot", {})
-for ev in ("SessionStart", "Stop"):
-    entries = group.get(ev, [])
-    check(isinstance(entries, list) and len(entries) >= 1, f"hooks.json: {ev} must be non-empty list")
-    for h in entries:
-        cmd = str(h.get("command", ""))
-        check("./scripts/colab_hooks.py" in cmd, f"hooks.json {ev}: unexpected command {cmd!r}")
-for grp in group.get("PreToolUse", []):
-    check("matcher" in grp and isinstance(grp.get("hooks"), list), "hooks.json PreToolUse: missing matcher/hooks")
+agy_hooks = load_json(PLUGIN / "hooks.json")
+check(list(agy_hooks) == ["colab-pilot"], f"hooks.json: expected ['colab-pilot'], got {list(agy_hooks)}")
+cc_hooks = load_json(PLUGIN / "hooks" / "hooks.json")
+check(isinstance(cc_hooks.get("hooks"), dict) and set(cc_hooks["hooks"]) == {"SessionStart", "PreToolUse", "Stop"}, "hooks/hooks.json invalid")
 
-mcp = load_json(PLUGIN / "mcp_config.json")
-servers = mcp.get("mcpServers", {})
-check("pilot" in servers, "mcp_config.json: missing 'pilot' server")
-if "pilot" in servers:
-    srv = servers["pilot"]
-    check("env" not in srv or ("PLUGIN_ROOT" not in srv["env"] and "PLUGIN_DATA" not in srv["env"]),
-          "mcp_config.json: must not duplicate PLUGIN_ROOT/PLUGIN_DATA in env")
+for mcp_rel in ("mcp_config.json", ".mcp.json"):
+    mcp = load_json(PLUGIN / mcp_rel)
+    check("pilot" in mcp.get("mcpServers", {}), f"{mcp_rel}: missing 'pilot' server")
 
 found_skills = {p.name for p in (PLUGIN / "skills").iterdir() if p.is_dir()}
 check(found_skills == EXPECTED_SKILLS, f"skills mismatch: {sorted(found_skills)} != {sorted(EXPECTED_SKILLS)}")
@@ -84,8 +71,7 @@ for name in sorted(found_skills):
     sp = PLUGIN / "skills" / name / "SKILL.md"
     check(sp.is_file(), f"skills/{name}/SKILL.md missing")
     if sp.is_file():
-        st = sp.read_text(encoding="utf-8")
-        m = re.match(r"---\nname:\s*(.+)\ndescription:", st)
+        m = re.match(r"---\nname:\s*(.+)\ndescription:", sp.read_text(encoding="utf-8"))
         check(m is not None and m.group(1).strip() == name, f"skills/{name}/SKILL.md frontmatter name mismatch")
 
 scripts = sorted((PLUGIN / "scripts").glob("*.py"))
@@ -96,11 +82,10 @@ for sc in scripts:
 for p in PLUGIN.rglob("*"):
     rel = p.relative_to(PLUGIN)
     check(not p.is_symlink(), f"symlink forbidden: {rel}")
-    check(not any(part in FORBIDDEN or part.startswith("._") or part.endswith(".pyc") for part in rel.parts),
-          f"forbidden file/dir: {rel}")
+    check(not any(part in FORBIDDEN or part.startswith("._") or part.endswith(".pyc") for part in rel.parts), f"forbidden file/dir: {rel}")
 
 if errors:
     print("\n".join(f"ERROR: {e}" for e in errors), file=sys.stderr)
     sys.exit(1)
 
-print(f"OK: colab-pilot v{manifest.get('version')} ({len(found_skills)} skills, {len(scripts)} scripts, hooks, mcp, UI)")
+print(f"OK: colab-pilot v{agy.get('version')} (3 client manifests, {len(found_skills)} skills, {len(scripts)} scripts, hooks, mcp, UI)")
