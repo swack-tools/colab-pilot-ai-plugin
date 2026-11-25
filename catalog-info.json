@@ -15,7 +15,7 @@
       "input_or_trigger": "/colab-pilot:colab-pilot Check active Colab sessions and Compute Unit burn.",
       "platform": "claude-code",
       "prerequisites": [
-        "Install Colab Pilot and authenticate the colab CLI."
+        "Install Colab Pilot and authenticate the colab command-line tool."
       ],
       "expected_behavior": "Inspect live Compute Unit balance, burn rate, and active assignments without allocating a new VM.",
       "sources": [
@@ -95,7 +95,7 @@
       "input_or_trigger": "Open the Colab Pilot dashboard and inspect active sessions.",
       "platform": "claude-code",
       "prerequisites": [
-        "Install Colab Pilot with Python 3.9 or later and the colab CLI."
+        "Install Colab Pilot with Python 3.9 or later and the colab command-line tool."
       ],
       "expected_behavior": "Start the local stdio pilot MCP server and expose all 10 Colab orchestration tools.",
       "sources": [
@@ -112,9 +112,9 @@
       "id": "tool-colab-dashboard",
       "capability_refs": ["mcp_tool:colab_dashboard"],
       "title": "Open the Colab Pilot dashboard",
-      "input_or_trigger": "Show my Colab Compute Unit balance and 1/5th monthly budget status.",
+      "input_or_trigger": "Show my Colab Compute Unit balance and one-fifth monthly budget status.",
       "platform": "claude-code",
-      "prerequisites": ["Authenticate the colab CLI."],
+      "prerequisites": ["Authenticate the colab command-line tool."],
       "expected_behavior": "Return live Compute Unit balance, burn rate, active sessions, detached jobs, and alarm state.",
       "sources": [
         {
@@ -151,7 +151,7 @@
       "input_or_trigger": "Mount Google Drive on session train-v10 in streaming mode.",
       "platform": "claude-code",
       "prerequisites": ["Configure a local rclone.conf file for Google Drive."],
-      "expected_behavior": "Copy rclone configuration to the Colab VM and mount Drive read-only without interactive OAuth prompts.",
+      "expected_behavior": "Copy rclone configuration to the Colab VM and mount Drive read-only without interactive OAuth 2.0 prompts.",
       "sources": [
         {
           "path": "docs/reference.md",
@@ -168,7 +168,7 @@
       "title": "Transfer large archives safely",
       "input_or_trigger": "Pre-stage dataset.tar to Google Drive at zero Compute Unit cost.",
       "platform": "codex",
-      "prerequisites": ["Provide a valid local file path."],
+      "prerequisites": ["Provide a valid local path."],
       "expected_behavior": "Route files up to 24 MiB directly and larger files through Drive staging or verified 24 MiB chunks.",
       "sources": [
         {
@@ -258,7 +258,7 @@
       "title": "Stop all active Colab VMs",
       "input_or_trigger": "Stop all active Colab sessions and verify zero burn rate.",
       "platform": "claude-code",
-      "prerequisites": ["Authenticate the colab CLI."],
+      "prerequisites": ["Authenticate the colab command-line tool."],
       "expected_behavior": "Stop every active Colab session, clear leases, and confirm zero active assignments.",
       "sources": [
         {
@@ -309,7 +309,7 @@
     {
       "id": "hook-pre-tool-use",
       "capability_refs": ["hook:PreToolUse:0:0"],
-      "title": "Block TTY-hanging or unsafe colab CLI calls",
+      "title": "Block TTY-hanging or unsafe colab command-line calls",
       "input_or_trigger": "Attempt to run colab drivemount or a 50 MiB direct colab upload.",
       "platform": "claude-code",
       "prerequisites": ["Enable Colab Pilot lifecycle hooks."],

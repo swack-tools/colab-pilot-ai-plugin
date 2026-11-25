@@ -2,7 +2,7 @@
 name: colab-pilot
 description: >-
   Open the Colab Pilot live Compute Unit dashboard, audit active sessions and
-  1/5th AI Ultra monthly budget, manage headless rclone/ADC auth, and sweep
+  one-fifth AI Ultra monthly budget, manage headless rclone/ADC auth, and sweep
   orphaned VMs. Use when the user invokes /colab-pilot or asks about Colab CU
   usage, sessions, or auth.
 ---
