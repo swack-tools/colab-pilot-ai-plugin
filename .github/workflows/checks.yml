@@ -35,3 +35,19 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/package_release.py "$RUNNER_TEMP/pkg1"
           PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/package_release.py "$RUNNER_TEMP/pkg2"
           diff -u "$RUNNER_TEMP/pkg1/SHA256SUMS" "$RUNNER_TEMP/pkg2/SHA256SUMS"
+
+  dockerfile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Lint Dockerfile with Hadolint (strict)
+        if: ${{ !env.ACT }}
+        run: |
+          docker run --rm -i hadolint/hadolint@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d \
+            hadolint --failure-threshold style --disable-ignore-pragma - < .devcontainer/Dockerfile
+      - name: Validate Dockerfile with Buildx check
+        if: ${{ !env.ACT }}
+        run: docker buildx build --check .devcontainer
