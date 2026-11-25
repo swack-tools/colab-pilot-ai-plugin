@@ -187,6 +187,77 @@ class ColabPilotTests(unittest.TestCase):
         self.assertIn("test-vm", by_id[7]["result"]["structuredContent"]["stopped"])
         self.assertTrue(by_id[8]["result"]["structuredContent"]["ok"])
 
+    def test_dashboard_nonblocking_while_tool_runs_and_parses_sessions(self) -> None:
+        mcp = _load_module("colab_mcp_server", SCRIPTS_DIR / "colab_mcp_server.py")
+        parsed = mcp._parse_sessions_output(
+            "[train-1] m-s-abc123 | Hardware: A100 | Shape: High-RAM | Variant: GPU\n"
+            "[?] m-s-orphan99 | Hardware: H100 | Shape: High-RAM | Variant: GPU\n"
+        )
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0]["name"], "train-1")
+        self.assertEqual(parsed[1]["name"], "?")
+        self.assertIn("m-s-orphan99", mcp._colab_web_url("m-s-orphan99"))
+
+        # Make fake `colab` sleep on `new` to simulate an active GPU allocation
+        slow_bin = self.tmp_path / "slow_colab"
+        slow_bin.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, time\n"
+            "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+            "if cmd == 'new':\n"
+            "    time.sleep(2.5)\n"
+            "    print('READY')\n"
+            "elif cmd == 'usage':\n"
+            "    print('Current balance: 5000.00\\nUsage rate: 12.50/hr\\nActive assignments: 2')\n"
+            "elif cmd == 'sessions':\n"
+            "    print('[train-1] m-s-abc123 | Hardware: A100 | Shape: High-RAM | Variant: GPU')\n"
+            "    print('[?] m-s-orphan99 | Hardware: H100 | Shape: High-RAM | Variant: GPU')\n"
+            "elif cmd == 'stop':\n"
+            "    print('stopped')\n"
+        )
+        slow_bin.chmod(0o755)
+        env = dict(self.env)
+        env["COLAB_BIN"] = str(slow_bin)
+
+        proc = subprocess.Popen(
+            [sys.executable, "-B", str(SCRIPTS_DIR / "colab_mcp_server.py"), "--data-dir", str(self.data_dir)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        try:
+            assert proc.stdin is not None and proc.stdout is not None
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}}) + "\n")
+            proc.stdin.flush()
+            init_resp = json.loads(proc.stdout.readline())
+            self.assertEqual(init_resp["id"], 1)
+
+            # Start slow allocation in background
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "colab_allocate_cascade", "arguments": {"session": "slow-vm", "tiers": ["A100"], "require_bf16": False}}}) + "\n")
+            proc.stdin.flush()
+
+            # Immediately request dashboard HTML + dashboard telemetry while id=2 is sleeping 2.5s
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "ui://colab-pilot/dashboard.html"}}) + "\n")
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "colab_dashboard", "arguments": {}}}) + "\n")
+            proc.stdin.flush()
+
+            first = json.loads(proc.stdout.readline())
+            second = json.loads(proc.stdout.readline())
+            got = {first["id"]: first, second["id"]: second}
+            self.assertEqual(set(got.keys()), {3, 4}, f"Dashboard blocked behind slow tool! got={got}")
+            dash = got[4]["result"]["structuredContent"]
+            self.assertEqual(len(dash["sessions"]), 2)
+            self.assertTrue(any(s["untracked"] and s["name"] == "untracked:m-s-orphan99" for s in dash["sessions"]))
+            self.assertTrue(any(op["tool"] == "colab_allocate_cascade" for op in dash["active_operations"]))
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+
     def test_watchdog_and_shard_merge(self) -> None:
         wd = _load_module("colab_watchdog", SCRIPTS_DIR / "colab_watchdog.py")
         self.assertEqual(wd.scan_log_state("epoch 1\nDONE: ok", "DONE:")[0], "done")

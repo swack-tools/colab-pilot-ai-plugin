@@ -17,7 +17,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -25,6 +27,10 @@ from typing import Any
 
 APP_URI = "ui://colab-pilot/dashboard.html"
 VALID_TIERS = {"A100-highmem", "A100", "G4", "L4", "H100", "T4", "NONE"}
+_SEND_LOCK = threading.Lock()
+_STATE_FILE_LOCK = threading.Lock()
+_ACTIVE_OPS_LOCK = threading.Lock()
+_ACTIVE_OPS: dict[str, dict[str, Any]] = {}
 
 
 def _plugin_root() -> Path:
@@ -47,19 +53,30 @@ def _sessions_file() -> Path:
 
 
 def _read_json(path: Path, default: Any) -> Any:
-    if not path.is_file():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
+    with _STATE_FILE_LOCK:
+        if not path.is_file():
+            return default
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
 
 
 def _write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    payload = json.dumps(data, indent=2)
+    with _STATE_FILE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
 
 def _run_colab(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
@@ -68,26 +85,125 @@ def _run_colab(args: list[str], timeout: int = 120) -> subprocess.CompletedProce
 
 
 def _parse_usage(data_dir: Path) -> dict[str, Any]:
+    prev = _read_json(data_dir / "usage_cache.json", None)
+    txt = ""
+    err_detail = ""
+    cli_installed = True
+    ok = False
     try:
-        res = _run_colab(["usage"], timeout=20)
+        res = _run_colab(["usage"], timeout=12)
         txt = res.stdout or ""
-        cli_installed = True
+        ok = res.returncode == 0
+        if not ok:
+            err_detail = (res.stderr or res.stdout or f"exit {res.returncode}").strip()[:200]
     except FileNotFoundError:
-        txt = ""
         cli_installed = False
+        err_detail = "colab CLI not found"
+    except subprocess.TimeoutExpired:
+        err_detail = "colab usage timed out"
+
     m_bal = re.search(r"Current balance:\s*([0-9.]+)", txt)
     m_rate = re.search(r"Usage rate:\s*([0-9.]+)/hr", txt)
     m_cnt = re.search(r"Active assignments:\s*(\d+)", txt)
+    if (not ok or m_bal is None) and isinstance(prev, dict) and "balance" in prev:
+        stale = dict(prev)
+        stale["cli_installed"] = cli_installed
+        stale["stale"] = True
+        if err_detail:
+            stale["raw_error"] = err_detail
+        return stale
+
     parsed = {
         "cli_installed": cli_installed,
         "balance": float(m_bal.group(1)) if m_bal else 0.0,
         "rate_hourly": float(m_rate.group(1)) if m_rate else 0.0,
         "active_assignments": int(m_cnt.group(1)) if m_cnt else 0,
         "raw": txt.strip(),
+        "stale": False,
         "updated_at": time.time(),
     }
+    if err_detail:
+        parsed["raw_error"] = err_detail
     _write_json(data_dir / "usage_cache.json", parsed)
     return parsed
+
+
+def _colab_web_url(endpoint: str) -> str:
+    if not endpoint:
+        return ""
+    host = "https://colab.research.google.com"
+    dbu = urllib.parse.quote(f"/tun/m/{endpoint}", safe="")
+    return f"{host}/notebooks/empty.ipynb?dbu={dbu}#datalabBackendUrl={host}/tun/m/{endpoint}"
+
+
+_SESSION_LINE_RE = re.compile(
+    r"^\s*\[([^\]]+)\]\s+(\S+)\s*\|\s*Hardware:\s*([^|]+?)\s*\|\s*Shape:\s*([^|]+?)\s*\|\s*Variant:\s*([^|\n]+?)(?:\s*\|\s*Status:\s*(.+))?$"
+)
+
+
+def _parse_sessions_output(txt: str) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for ln in txt.splitlines():
+        m = _SESSION_LINE_RE.match(ln)
+        if not m:
+            continue
+        out.append(
+            {
+                "name": m.group(1).strip(),
+                "endpoint": m.group(2).strip(),
+                "hardware": m.group(3).strip(),
+                "shape": m.group(4).strip(),
+                "variant": m.group(5).strip(),
+                "status": (m.group(6) or "").strip(),
+            }
+        )
+    return out
+
+
+def _list_active_ops() -> list[dict[str, Any]]:
+    now = time.time()
+    with _ACTIVE_OPS_LOCK:
+        items = list(_ACTIVE_OPS.values())
+    return [
+        {
+            "tool": op["tool"],
+            "session": op.get("session") or "",
+            "elapsed_sec": round(max(0.0, now - float(op["started_at"])), 1),
+        }
+        for op in items
+    ]
+
+
+def _colab_python_bin() -> str:
+    try:
+        colab_bin = _resolve_colab_bin()
+        with open(colab_bin, "r", encoding="utf-8", errors="ignore") as f:
+            first = f.readline().strip()
+        if first.startswith("#!"):
+            interp = first[2:].strip().split()[0]
+            if interp and os.path.exists(interp):
+                return interp
+    except Exception:
+        pass
+    return sys.executable
+
+
+def _unassign_endpoint(endpoint: str) -> None:
+    py_bin = _colab_python_bin()
+    res = subprocess.run(
+        [
+            py_bin,
+            "-B",
+            "-c",
+            "import sys; from colab_cli.common import state; state.client.unassign(sys.argv[1])",
+            endpoint,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if res.returncode != 0:
+        raise RuntimeError((res.stderr or res.stdout or f"unassign failed ({res.returncode})").strip())
 
 
 def _get_leases(data_dir: Path) -> dict[str, dict[str, Any]]:
@@ -141,52 +257,18 @@ def _read_env_secret(key: str) -> str:
 # Tool Implementations
 # ---------------------------------------------------------------------------
 
-def tool_colab_dashboard(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
-    ultra_monthly_cu = float(args.get("ultra_monthly_cu", 25000.0) or 25000.0)
-    budget_fraction = float(args.get("budget_fraction", 0.20) or 0.20)
+def _fetch_sessions_safe() -> list[dict[str, str]]:
+    try:
+        res = _run_colab(["sessions"], timeout=12)
+        if res.returncode == 0:
+            return _parse_sessions_output(res.stdout or "")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return []
 
-    usage = _parse_usage(data_dir)
-    if usage.get("cli_installed", True):
-        try:
-            _run_colab(["sessions"], timeout=20)
-        except FileNotFoundError:
-            pass
-    local_sessions = _read_json(_sessions_file(), {})
-    if not isinstance(local_sessions, dict):
-        local_sessions = {}
 
-    leases = _get_leases(data_dir)
-    now = time.time()
-    session_list: list[dict[str, Any]] = []
-    for name, meta in local_sessions.items():
-        if not isinstance(meta, dict):
-            continue
-        lease = leases.get(name)
-        lease_min = ((float(lease["expires_at"]) - now) / 60.0) if lease else 0.0
-        web_url = ""
-        try:
-            u_res = _run_colab(["url", "-s", name], timeout=10)
-            if u_res.returncode == 0 and u_res.stdout.strip().startswith("http"):
-                web_url = u_res.stdout.strip().splitlines()[-1]
-        except Exception:
-            pass
-        session_list.append(
-            {
-                "name": name,
-                "accelerator": meta.get("accelerator", "NONE"),
-                "machine_shape": meta.get("machine_shape", "STANDARD"),
-                "status": "active",
-                "lease_expires_in_min": round(lease_min, 1) if lease_min > 0 else None,
-                "web_url": web_url,
-            }
-        )
-
-    jobs_raw = _read_json(data_dir / "detached_jobs.json", {})
-    job_list = list(jobs_raw.values()) if isinstance(jobs_raw, dict) else []
-    job_list.sort(key=lambda j: float(j.get("started_at", 0) or 0), reverse=True)
-
+def _fetch_alarm_status() -> dict[str, Any]:
     alarm_script = _plugin_root() / "scripts" / "colab_wakeup_alarm.py"
-    alarm_status: dict[str, Any] = {"running": False}
     if alarm_script.is_file():
         try:
             ares = subprocess.run(
@@ -196,9 +278,85 @@ def tool_colab_dashboard(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]
                 timeout=5,
             )
             if ares.returncode == 0 and ares.stdout.strip():
-                alarm_status = json.loads(ares.stdout)
+                return json.loads(ares.stdout)
         except Exception:
             pass
+    return {"running": False}
+
+
+def tool_colab_dashboard(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
+    ultra_monthly_cu = float(args.get("ultra_monthly_cu", 25000.0) or 25000.0)
+    budget_fraction = float(args.get("budget_fraction", 0.20) or 0.20)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_usage = pool.submit(_parse_usage, data_dir)
+        f_sessions = pool.submit(_fetch_sessions_safe)
+        f_alarm = pool.submit(_fetch_alarm_status)
+        usage = f_usage.result()
+        server_sessions = f_sessions.result()
+        alarm_status = f_alarm.result()
+
+    local_sessions = _read_json(_sessions_file(), {})
+    if not isinstance(local_sessions, dict):
+        local_sessions = {}
+
+    server_by_name = {s["name"]: s for s in server_sessions if s["name"] != "?"}
+    leases = _get_leases(data_dir)
+    now = time.time()
+    session_list: list[dict[str, Any]] = []
+    seen_endpoints: set[str] = set()
+
+    for name, meta in local_sessions.items():
+        if not isinstance(meta, dict):
+            continue
+        srv = server_by_name.get(name, {})
+        endpoint = str(meta.get("endpoint") or srv.get("endpoint") or "")
+        if endpoint:
+            seen_endpoints.add(endpoint)
+        lease = leases.get(name)
+        lease_min = ((float(lease["expires_at"]) - now) / 60.0) if lease else 0.0
+        running_job = meta.get("running")
+        status = f"busy ({running_job})" if running_job else "active"
+        session_list.append(
+            {
+                "name": name,
+                "display_name": name,
+                "endpoint": endpoint,
+                "untracked": False,
+                "accelerator": meta.get("accelerator") or srv.get("hardware") or "NONE",
+                "machine_shape": meta.get("machine_shape") or srv.get("shape") or "STANDARD",
+                "status": status,
+                "lease_expires_in_min": round(lease_min, 1) if lease_min > 0 else None,
+                "web_url": _colab_web_url(endpoint),
+            }
+        )
+
+    for srv in server_sessions:
+        ep = srv["endpoint"]
+        if ep in seen_endpoints:
+            continue
+        seen_endpoints.add(ep)
+        is_orphan = srv["name"] == "?"
+        sess_key = f"untracked:{ep}" if is_orphan else srv["name"]
+        display_name = f"Untracked ({ep[:16]}…)" if is_orphan else srv["name"]
+        session_list.append(
+            {
+                "name": sess_key,
+                "display_name": display_name,
+                "endpoint": ep,
+                "untracked": is_orphan,
+                "accelerator": srv["hardware"] or "NONE",
+                "machine_shape": srv["shape"] or "STANDARD",
+                "status": "orphaned (server)" if is_orphan else (srv["status"] or "active"),
+                "lease_expires_in_min": None,
+                "web_url": _colab_web_url(ep),
+            }
+        )
+
+    jobs_raw = _read_json(data_dir / "detached_jobs.json", {})
+    job_list = list(jobs_raw.values()) if isinstance(jobs_raw, dict) else []
+    job_list.sort(key=lambda j: float(j.get("started_at", 0) or 0), reverse=True)
+    active_ops = _list_active_ops()
 
     structured = {
         "usage": usage,
@@ -207,6 +365,7 @@ def tool_colab_dashboard(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]
         "sessions": session_list,
         "jobs": job_list[:10],
         "alarm": alarm_status,
+        "active_operations": active_ops,
     }
     summary = (
         f"Colab Pilot — Balance: {usage['balance']:.2f} CU | "
@@ -214,6 +373,8 @@ def tool_colab_dashboard(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]
         f"Active assignments: {usage['active_assignments']} | "
         f"Tracked sessions: {len(session_list)} | Tracked jobs: {len(job_list)}"
     )
+    if active_ops:
+        summary += f" | In-flight ops: {len(active_ops)}"
     return {
         "content": [{"type": "text", "text": summary}],
         "structuredContent": structured,
@@ -751,21 +912,31 @@ def tool_colab_stop_all(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
     leases = _get_leases(data_dir)
 
     if target:
-        _run_colab(["stop", "-s", target], timeout=45)
-        stopped.append(target)
-        leases.pop(target, None)
+        if target.startswith("untracked:"):
+            ep = target.split("untracked:", 1)[1]
+            _unassign_endpoint(ep)
+            stopped.append(target)
+        else:
+            _run_colab(["stop", "-s", target], timeout=45)
+            stopped.append(target)
+            leases.pop(target, None)
     else:
         local = _read_json(_sessions_file(), {})
         names = list(local.keys()) if isinstance(local, dict) else []
-        s_res = _run_colab(["sessions"], timeout=20)
-        for ln in s_res.stdout.splitlines():
-            m = re.match(r"^\s*([A-Za-z0-9_.-]+)\s+\|", ln)
-            if m and m.group(1) not in names and m.group(1).lower() != "name":
-                names.append(m.group(1))
+        srv_sessions = _fetch_sessions_safe()
+        orphan_endpoints: list[str] = []
+        for s in srv_sessions:
+            if s["name"] == "?":
+                orphan_endpoints.append(s["endpoint"])
+            elif s["name"] not in names:
+                names.append(s["name"])
         for n in names:
             _run_colab(["stop", "-s", n], timeout=45)
             stopped.append(n)
             leases.pop(n, None)
+        for ep in orphan_endpoints:
+            _unassign_endpoint(ep)
+            stopped.append(f"untracked:{ep}")
 
     _write_json(data_dir / "kept_sessions.json", leases)
     usage = _parse_usage(data_dir)
@@ -963,8 +1134,10 @@ TOOL_DISPATCH = {
 
 
 def _send(obj: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
+    line = json.dumps(obj) + "\n"
+    with _SEND_LOCK:
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 def _handle_request(req: dict[str, Any], data_dir: Path) -> None:
@@ -988,7 +1161,7 @@ def _handle_request(req: dict[str, Any], data_dir: Path) -> None:
                             "tools": {"listChanged": False},
                             "resources": {"subscribe": False, "listChanged": False},
                         },
-                        "serverInfo": {"name": "colab-pilot", "version": "1.0.0"},
+                        "serverInfo": {"name": "colab-pilot", "version": "1.1.2"},
                     },
                 }
             )
@@ -1054,6 +1227,15 @@ def _handle_request(req: dict[str, Any], data_dir: Path) -> None:
             if not fn:
                 _send({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool: {name}"}})
                 return
+            op_id = uuid.uuid4().hex if name != "colab_dashboard" else ""
+            if op_id:
+                with _ACTIVE_OPS_LOCK:
+                    _ACTIVE_OPS[op_id] = {
+                        "op_id": op_id,
+                        "tool": name,
+                        "session": str(arguments.get("session") or ""),
+                        "started_at": time.time(),
+                    }
             try:
                 res = fn(data_dir, arguments)
                 _send({"jsonrpc": "2.0", "id": req_id, "result": res})
@@ -1068,6 +1250,10 @@ def _handle_request(req: dict[str, Any], data_dir: Path) -> None:
                         },
                     }
                 )
+            finally:
+                if op_id:
+                    with _ACTIVE_OPS_LOCK:
+                        _ACTIVE_OPS.pop(op_id, None)
             return
 
         _send({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}})
@@ -1082,16 +1268,23 @@ def main() -> int:
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError as exc:
-            _send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"Parse error: {exc}"}})
-            continue
-        _handle_request(req, data_dir)
+    executor = ThreadPoolExecutor(max_workers=8)
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError as exc:
+                _send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"Parse error: {exc}"}})
+                continue
+            if req.get("method") == "tools/call":
+                executor.submit(_handle_request, req, data_dir)
+            else:
+                _handle_request(req, data_dir)
+    finally:
+        executor.shutdown(wait=True)
 
     return 0
 

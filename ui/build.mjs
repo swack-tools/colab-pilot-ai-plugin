@@ -11,6 +11,7 @@ const res = await esbuild.build({
 });
 
 const js = res.outputFiles[0].text;
+const safeJs = js.replace(/<\/script/gi, '<\\/script');
 const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -73,7 +74,7 @@ const html = `<!doctype html>
 </head>
 <body>
 <div id="app"><div class="loading">Connecting to Colab Pilot...</div></div>
-<script>${js}</script>
+<script>${safeJs}</script>
 </body>
 </html>
 `;

@@ -4,9 +4,10 @@ import {
   applyHostStyleVariables,
 } from '@modelcontextprotocol/ext-apps';
 
-const app = new App({ name: 'Colab Pilot', version: '1.0.0' }, {});
+const app = new App({ name: 'Colab Pilot', version: '1.1.2' }, {});
 let currentState = null;
 let busyAction = '';
+let receivedInitialResult = false;
 
 function esc(str) {
   return String(str ?? '')
@@ -30,8 +31,9 @@ function setBanner(msg, isError = false) {
 }
 
 async function runTool(name, args = {}, label = '') {
+  if (busyAction && name === 'colab_dashboard' && label === 'Auto-refresh') return;
   busyAction = label || name;
-  setBanner(`Running ${busyAction}...`);
+  if (label !== 'Auto-refresh') setBanner(`Running ${busyAction}...`);
   try {
     const res = await app.callServerTool({ name, arguments: args });
     if (res?.isError) {
@@ -46,7 +48,6 @@ async function runTool(name, args = {}, label = '') {
     } else {
       const txt = (res?.content || []).map((c) => c.text || '').join(' ');
       setBanner(txt ? txt.slice(0, 220) : `${name} completed`);
-      // Auto-refresh dashboard after state-mutating actions
       const dash = await app.callServerTool({ name: 'colab_dashboard', arguments: {} });
       if (dash?.structuredContent) {
         currentState = dash.structuredContent;
@@ -63,45 +64,75 @@ async function runTool(name, args = {}, label = '') {
 function render(data) {
   const root = document.getElementById('app');
   if (!root) return;
-  if (!data) {
-    root.innerHTML = `<div class="loading">Loading Colab Pilot telemetry...</div>`;
-    return;
-  }
 
-  const usage = data.usage || {};
+  const isLoading = !data;
+  const usage = data?.usage || {};
   const balance = Number(usage.balance ?? 0);
   const rate = Number(usage.rate_hourly ?? 0);
   const activeCount = Number(usage.active_assignments ?? 0);
-  const monthlyCu = Number(data.ultra_monthly_cu ?? 25000);
-  const budgetFrac = Number(data.budget_fraction ?? 0.2);
+  const monthlyCu = Number(data?.ultra_monthly_cu ?? 25000);
+  const budgetFrac = Number(data?.budget_fraction ?? 0.2);
   const budgetCap = monthlyCu * budgetFrac;
   const pctRemainingOfCap = budgetCap > 0 ? Math.min(100, Math.max(0, (balance / budgetCap) * 100)) : 100;
 
-  const sessions = Array.isArray(data.sessions) ? data.sessions : [];
-  const jobs = Array.isArray(data.jobs) ? data.jobs : [];
-  const alarm = data.alarm || {};
+  const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
+  const jobs = Array.isArray(data?.jobs) ? data.jobs : [];
+  const activeOps = Array.isArray(data?.active_operations) ? data.active_operations : [];
+  const alarm = data?.alarm || {};
   const caps = app.getHostCapabilities() || {};
   const canOpenLinks = Boolean(caps.openLinks);
 
   const rateClass = rate > 0 ? 'pill pill-warn' : 'pill pill-ok';
-  const rateText = rate > 0 ? `${rate.toFixed(2)} CU/hr` : '0.00 CU/hr (Idle)';
+  const rateText = isLoading ? 'Syncing…' : rate > 0 ? `${rate.toFixed(2)} CU/hr` : '0.00 CU/hr (Idle)';
+  const staleBadge = usage.stale ? ' <span class="pill pill-muted">cached</span>' : '';
+
+  const opsSection = activeOps.length
+    ? `
+      <section class="sec">
+        <div class="sec-hdr">
+          <h2>In-Flight MCP Operations (${activeOps.length})</h2>
+        </div>
+        ${activeOps
+          .map(
+            (op) => `
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">${esc(op.tool)}${op.session ? ` <span class="muted">on ${esc(op.session)}</span>` : ''}</div>
+                <div class="card-sub">Running for ${esc(op.elapsed_sec)}s</div>
+              </div>
+              <span class="pill pill-info">running</span>
+            </div>
+          </div>
+        `
+          )
+          .join('')}
+      </section>
+    `
+    : '';
 
   const sessionCards = sessions.length
     ? sessions
         .map((s) => {
           const leaseBadge = s.lease_expires_in_min
             ? `<span class="pill pill-info">Warm ${Math.round(s.lease_expires_in_min)}m</span>`
-            : `<span class="pill pill-muted">No Lease</span>`;
+            : `<span class="pill pill-muted">${s.untracked ? 'Untracked' : 'No Lease'}</span>`;
           const hw = `${s.accelerator || 'CPU'} · ${s.machine_shape || 'STANDARD'}`;
           const openBtn =
             canOpenLinks && s.web_url
               ? `<button class="btn btn-ghost" data-action="open-url" data-url="${esc(s.web_url)}">Open Web UI</button>`
               : '';
+          const namedActions = s.untracked
+            ? ''
+            : `
+                <button class="btn" data-action="reset-vram" data-session="${esc(s.name)}">Flush Zombie VRAM</button>
+                <button class="btn" data-action="keep-warm" data-session="${esc(s.name)}">Keep Warm 30m</button>
+              `;
           return `
             <div class="card session-card">
               <div class="card-head">
                 <div>
-                  <div class="card-title">${esc(s.name)}</div>
+                  <div class="card-title">${esc(s.display_name || s.name)}</div>
                   <div class="card-sub">${esc(hw)} · ${esc(s.status || 'unknown')}</div>
                 </div>
                 <div class="badges">
@@ -109,8 +140,7 @@ function render(data) {
                 </div>
               </div>
               <div class="btn-row">
-                <button class="btn" data-action="reset-vram" data-session="${esc(s.name)}">Flush Zombie VRAM</button>
-                <button class="btn" data-action="keep-warm" data-session="${esc(s.name)}">Keep Warm 30m</button>
+                ${namedActions}
                 ${openBtn}
                 <button class="btn btn-danger" data-action="stop-one" data-session="${esc(s.name)}">Stop VM</button>
               </div>
@@ -118,7 +148,7 @@ function render(data) {
           `;
         })
         .join('')
-    : `<div class="empty">No active Colab VMs allocated (0.00 CU/hr).</div>`;
+    : `<div class="empty">${isLoading ? 'Loading active Colab sessions...' : 'No active Colab VMs allocated (0.00 CU/hr).'}</div>`;
 
   const jobCards = jobs.length
     ? jobs
@@ -159,26 +189,28 @@ function render(data) {
         <button class="btn btn-primary" data-action="refresh">Refresh</button>
       </header>
 
-      <div id="banner" class="banner" style="display:none"></div>
+      <div id="banner" class="banner" style="display:${isLoading ? 'block' : 'none'}">${isLoading ? 'Syncing live Colab telemetry...' : ''}</div>
 
       <section class="kpi-grid">
         <div class="kpi">
           <div class="kpi-label">CU Balance</div>
-          <div class="kpi-val">${balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} CU</div>
+          <div class="kpi-val">${isLoading ? '—' : `${balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} CU`}${staleBadge}</div>
         </div>
         <div class="kpi">
           <div class="kpi-label">Live Burn Rate</div>
-          <div class="kpi-val"><span class="${rateClass}">${esc(rateText)}</span></div>
+          <div class="kpi-val"><span class="${isLoading ? 'pill pill-muted' : rateClass}">${esc(rateText)}</span></div>
         </div>
         <div class="kpi">
           <div class="kpi-label">Active Assignments</div>
-          <div class="kpi-val">${activeCount}</div>
+          <div class="kpi-val">${isLoading ? '—' : activeCount}</div>
         </div>
         <div class="kpi">
           <div class="kpi-label">1/5th Monthly Cap (${Math.round(budgetCap).toLocaleString()} CU)</div>
-          <div class="meter"><div class="meter-fill" style="width:${pctRemainingOfCap.toFixed(1)}%"></div></div>
+          <div class="meter"><div class="meter-fill" style="width:${isLoading ? 0 : pctRemainingOfCap.toFixed(1)}%"></div></div>
         </div>
       </section>
+
+      ${opsSection}
 
       <section class="sec">
         <div class="sec-hdr">
@@ -234,9 +266,17 @@ app.ontoolinput = () => {
 };
 
 app.ontoolresult = (result) => {
+  receivedInitialResult = true;
+  if (result?.isError) {
+    const txt = (result.content || []).map((c) => c.text || '').join(' ');
+    render(currentState);
+    setBanner(txt || 'Dashboard telemetry query returned an error.', true);
+    return;
+  }
   if (result?.structuredContent) {
     currentState = result.structuredContent;
     render(currentState);
+    setBanner('');
   }
 };
 
@@ -246,11 +286,29 @@ app.onhostcontextchanged = (ctx) => {
 };
 
 async function init() {
+  render(currentState);
   await app.connect();
   const ctx = app.getHostContext();
   if (ctx?.theme) applyDocumentTheme(ctx.theme);
   if (ctx?.styles?.variables) applyHostStyleVariables(ctx.styles.variables);
   render(currentState);
+
+  window.setTimeout(() => {
+    if (!receivedInitialResult && !currentState && !busyAction) {
+      runTool('colab_dashboard', {}, 'Sync');
+    }
+  }, 1500);
+
+  window.setInterval(() => {
+    if (document.visibilityState !== 'visible' || busyAction || !currentState) return;
+    const hasActivity =
+      (currentState.active_operations || []).length > 0 ||
+      Number(currentState.usage?.active_assignments || 0) > 0 ||
+      (currentState.jobs || []).some((j) => j.state === 'running');
+    if (hasActivity) {
+      runTool('colab_dashboard', {}, 'Auto-refresh');
+    }
+  }, 12000);
 }
 
 init();
