@@ -32,6 +32,10 @@ STATE_FILE = Path("/tmp/colab_pilot_alarm.json")
 
 _PREFERRED_VOICES = [
     "Samantha (English (US))",
+    "Daniel (English (UK))",
+    "Moira (English (Ireland))",
+    "Aman (English (India))",
+    "Rishi (English (India))",
     "Daniel",
     "Karen",
     "Moira",
@@ -74,7 +78,7 @@ def discover_english_voices() -> list[str]:
     available: list[str] = []
     seen: set[str] = set()
     for line in res.stdout.splitlines():
-        m = re.match(r"^(.+?)\s{2,}(en_(?:US|GB|AU|IN|IE|SC|ZA))\s+#", line)
+        m = re.match(r"^(.+?)\s+(en_(?:US|GB|AU|IN|IE|SC|ZA))\s+#", line)
         if not m:
             continue
         name = m.group(1).strip()
@@ -91,7 +95,7 @@ def discover_english_voices() -> list[str]:
 def compute_schedule_params(progress: float) -> dict[str, float | int]:
     """Compute volume, speech WPM, beep count/timing, and pause from progress in [0, 1]."""
     p = max(0.0, min(1.0, float(progress)))
-    volume = round(0.04 + 1.96 * (p ** 1.35), 4)
+    volume = round(0.20 + 1.80 * (p ** 1.35), 4)
     wpm = int(round(140 + 220 * p))
     n_beeps = 1 + int(5 * p)
     beep_dur = round(0.18 - 0.125 * p, 4)
@@ -241,6 +245,47 @@ def run_self_test() -> dict[str, object]:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def run_test_chirp(phrase: str = "Colab Pilot chirp test", play_audio: bool = True) -> dict[str, object]:
+    """Synthesize a crisp chirp + short speech phrase and play audio when available."""
+    voices = discover_english_voices()
+    voice = voices[0]
+    has_say = bool(shutil.which("say"))
+    has_afplay = bool(shutil.which("afplay"))
+    played = False
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="colab_alarm_chirp_"))
+    try:
+        wav_p = tmp_dir / "chirp.wav"
+        write_beep_wav(wav_p, n_beeps=3, beep_dur=0.10, beep_gap=0.055, f_low=880.0)
+
+        aiff_p = tmp_dir / "tts.aiff"
+        if has_say:
+            subprocess.run(
+                ["say", "-v", voice, "-r", "185", "-o", str(aiff_p), phrase],
+                check=True,
+                capture_output=True,
+            )
+
+        if play_audio and has_afplay:
+            r1 = subprocess.run(["afplay", "-v", "0.55", str(wav_p)], capture_output=True, text=True, check=False)
+            if r1.returncode != 0:
+                raise RuntimeError(f"afplay chirp failed: {(r1.stderr or r1.stdout).strip()}")
+            if aiff_p.is_file():
+                r2 = subprocess.run(["afplay", "-v", "0.55", str(aiff_p)], capture_output=True, text=True, check=False)
+                if r2.returncode != 0:
+                    raise RuntimeError(f"afplay speech failed: {(r2.stderr or r2.stdout).strip()}")
+            played = True
+
+        return {
+            "ok": True,
+            "played_audio": played,
+            "voice": voice,
+            "phrase": phrase,
+        }
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def stop_alarm(pid_file: Path) -> dict[str, object]:
     STOP_FLAG.touch()
     pid = 0
@@ -354,7 +399,7 @@ def run_alarm_loop(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Escalating multi-voice macOS wakeup alarm")
-    p.add_argument("--action", choices=("start", "stop", "status", "self-test"), default="status")
+    p.add_argument("--action", choices=("start", "stop", "status", "self-test", "test-chirp"), default="status")
     p.add_argument("--phrase", default="0 0 0 0 0 Colab job complete")
     p.add_argument("--ramp-seconds", type=float, default=300.0)
     p.add_argument("--max-seconds", type=float, default=1200.0)
@@ -369,6 +414,11 @@ def main() -> int:
 
     if args.action == "self-test":
         res = run_self_test()
+        print(json.dumps(res, indent=2))
+        return 0
+
+    if args.action == "test-chirp":
+        res = run_test_chirp(phrase=args.phrase, play_audio=True)
         print(json.dumps(res, indent=2))
         return 0
 

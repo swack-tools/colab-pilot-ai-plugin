@@ -264,6 +264,14 @@ class ColabPilotTests(unittest.TestCase):
         self.assertEqual(wd.scan_log_state("CUDA out of memory", "DONE:")[0], "error")
         self.assertEqual(wd.scan_log_state("CUDA out of memory\n[retry] Retrying\nDONE: ok", "DONE:")[0], "done")
 
+        alarm = _load_module("colab_wakeup_alarm", SCRIPTS_DIR / "colab_wakeup_alarm.py")
+        chirp = alarm.run_test_chirp("Colab Pilot chirp test", play_audio=False)
+        self.assertTrue(chirp["ok"])
+        self.assertFalse(chirp["played_audio"])
+        self.assertEqual(chirp["phrase"], "Colab Pilot chirp test")
+        if sys.platform == "darwin":
+            self.assertEqual(chirp["voice"], "Samantha (English (US))")
+
     def test_deterministic_packaging(self) -> None:
         pkg = _load_module("package_release", ROOT / "scripts" / "package_release.py")
         d1 = self.tmp_path / "dist1"

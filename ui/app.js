@@ -4,10 +4,11 @@ import {
   applyHostStyleVariables,
 } from '@modelcontextprotocol/ext-apps';
 
-const app = new App({ name: 'Colab Pilot', version: '1.1.2' }, {});
+const app = new App({ name: 'Colab Pilot', version: '1.1.3' }, {});
 let currentState = null;
 let busyAction = '';
 let receivedInitialResult = false;
+let bannerState = { msg: '', isError: false };
 
 function esc(str) {
   return String(str ?? '')
@@ -18,16 +19,17 @@ function esc(str) {
 }
 
 function setBanner(msg, isError = false) {
+  bannerState = { msg: msg || '', isError: Boolean(isError) };
   const el = document.getElementById('banner');
   if (!el) return;
-  if (!msg) {
+  if (!bannerState.msg) {
     el.style.display = 'none';
     el.textContent = '';
     return;
   }
   el.style.display = 'block';
-  el.className = isError ? 'banner banner-err' : 'banner banner-info';
-  el.textContent = msg;
+  el.className = bannerState.isError ? 'banner banner-err' : 'banner banner-info';
+  el.textContent = bannerState.msg;
 }
 
 async function runTool(name, args = {}, label = '') {
@@ -43,11 +45,22 @@ async function runTool(name, args = {}, label = '') {
     }
     if (name === 'colab_dashboard' && res?.structuredContent) {
       currentState = res.structuredContent;
+      if (label !== 'Auto-refresh') {
+        bannerState = { msg: '', isError: false };
+      }
       render(currentState);
-      setBanner('');
     } else {
-      const txt = (res?.content || []).map((c) => c.text || '').join(' ');
-      setBanner(txt ? txt.slice(0, 220) : `${name} completed`);
+      let msg = '';
+      if (name === 'colab_wakeup_alarm' && args?.action === 'test_chirp' && res?.structuredContent) {
+        const sc = res.structuredContent;
+        msg = sc.played_audio
+          ? `Played test chirp (${sc.voice || 'macOS voice'}).`
+          : 'Synthesized chirp (audio playback unavailable on host).';
+      } else {
+        const txt = (res?.content || []).map((c) => c.text || '').join(' ');
+        msg = txt ? txt.slice(0, 220) : `${name} completed`;
+      }
+      setBanner(msg);
       const dash = await app.callServerTool({ name: 'colab_dashboard', arguments: {} });
       if (dash?.structuredContent) {
         currentState = dash.structuredContent;
@@ -189,7 +202,7 @@ function render(data) {
         <button class="btn btn-primary" data-action="refresh">Refresh</button>
       </header>
 
-      <div id="banner" class="banner" style="display:${isLoading ? 'block' : 'none'}">${isLoading ? 'Syncing live Colab telemetry...' : ''}</div>
+      <div id="banner" class="banner ${bannerState.isError ? 'banner-err' : 'banner-info'}" style="display:${bannerState.msg || isLoading ? 'block' : 'none'}">${esc(bannerState.msg || (isLoading ? 'Syncing live Colab telemetry...' : ''))}</div>
 
       <section class="kpi-grid">
         <div class="kpi">
@@ -233,7 +246,7 @@ function render(data) {
           <span class="pill ${alarm.running ? 'pill-warn' : 'pill-muted'}">${alarm.running ? 'ACTIVE' : 'Idle'}</span>
         </div>
         <div class="btn-row">
-          <button class="btn" data-action="alarm-test">Test Chirp (Self-Test)</button>
+          <button class="btn" data-action="alarm-test">Test Chirp</button>
           <button class="btn btn-danger" data-action="alarm-stop">Silence Alarm</button>
         </div>
       </section>
@@ -253,7 +266,7 @@ function render(data) {
       else if (act === 'reset-vram') runTool('colab_reset_vram', { session: sess }, `Flush VRAM (${sess})`);
       else if (act === 'keep-warm') runTool('colab_keep_warm', { session: sess, minutes: 30, reason: 'Dashboard lease' }, `Keep Warm ${sess}`);
       else if (act === 'poll-job') runTool('colab_poll_job', { session: sess, job_id: job }, `Poll ${job}`);
-      else if (act === 'alarm-test') runTool('colab_wakeup_alarm', { action: 'self_test' }, 'Alarm Self-Test');
+      else if (act === 'alarm-test') runTool('colab_wakeup_alarm', { action: 'test_chirp' }, 'Test Chirp');
       else if (act === 'alarm-stop') runTool('colab_wakeup_alarm', { action: 'stop' }, 'Silence Alarm');
       else if (act === 'open-url' && url) app.openLink({ url });
     });

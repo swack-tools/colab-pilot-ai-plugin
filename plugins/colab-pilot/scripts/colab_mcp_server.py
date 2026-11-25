@@ -946,16 +946,24 @@ def tool_colab_stop_all(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
 
 def tool_colab_wakeup_alarm(_data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
     action = str(args.get("action", "status"))
-    phrase = str(args.get("phrase", "0 0 0 0 0 Colab job complete"))
+    default_phrase = "Colab Pilot chirp test" if action == "test_chirp" else "0 0 0 0 0 Colab job complete"
+    phrase = str(args.get("phrase") or default_phrase)
     ramp = float(args.get("ramp_seconds", 300) or 300)
     script = _plugin_root() / "scripts" / "colab_wakeup_alarm.py"
     if not script.is_file():
         raise FileNotFoundError(f"Missing alarm script: {script}")
 
-    cli_action = "self-test" if action == "self_test" else action
+    if action == "self_test":
+        cli_action = "self-test"
+    elif action == "test_chirp":
+        cli_action = "test-chirp"
+    else:
+        cli_action = action
     cmd = [sys.executable, "-B", str(script), "--action", cli_action]
     if cli_action == "start":
         cmd.extend(["--daemon", "--phrase", phrase, "--ramp-seconds", str(ramp)])
+    elif cli_action == "test-chirp":
+        cmd.extend(["--phrase", phrase])
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if res.returncode != 0:
         raise RuntimeError(res.stderr or res.stdout)
@@ -1105,11 +1113,11 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "colab_wakeup_alarm",
-        "description": "Control the escalating multi-voice macOS TTS + chirp wakeup alarm (start, stop, status, self_test).",
+        "description": "Control the escalating multi-voice macOS TTS + chirp wakeup alarm (start, stop, status, test_chirp, self_test).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["start", "stop", "status", "self_test"], "default": "status"},
+                "action": {"type": "string", "enum": ["start", "stop", "status", "test_chirp", "self_test"], "default": "status"},
                 "phrase": {"type": "string", "default": "0 0 0 0 0 Colab job complete"},
                 "ramp_seconds": {"type": "number", "default": 300},
             },
@@ -1161,7 +1169,7 @@ def _handle_request(req: dict[str, Any], data_dir: Path) -> None:
                             "tools": {"listChanged": False},
                             "resources": {"subscribe": False, "listChanged": False},
                         },
-                        "serverInfo": {"name": "colab-pilot", "version": "1.1.2"},
+                        "serverInfo": {"name": "colab-pilot", "version": "1.1.3"},
                     },
                 }
             )
