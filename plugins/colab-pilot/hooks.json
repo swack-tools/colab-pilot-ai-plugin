@@ -1,0 +1,30 @@
+{
+  "colab-pilot": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 -B ./scripts/colab_hooks.py session-start",
+        "timeout": 8
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -B ./scripts/colab_hooks.py pre-tool-use",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 -B ./scripts/colab_hooks.py stop",
+        "timeout": 8
+      }
+    ]
+  }
+}

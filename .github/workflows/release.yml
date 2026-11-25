@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional tag override (defaults to v<plugin.json version>)
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: [self-hosted, Linux, X64, swack-tools]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve and verify release version
+        id: meta
+        run: |
+          VERSION="$(python3 -c 'import json; print(json.load(open("plugins/colab-pilot/plugin.json"))["version"])')"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="v$VERSION"
+          fi
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::Tag $TAG does not match plugin.json version v$VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Validate plugin contract and run tests
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/check_plugin.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -v
+
+      - name: Build deterministic release artifacts
+        run: |
+          rm -rf dist
+          PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/package_release.py dist
+          (cd dist && sha256sum -c SHA256SUMS)
+          ls -lh dist/
+
+      - name: Upload workflow release artifact
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: colab-pilot-release
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: ${{ !env.ACT }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --target "$GITHUB_SHA" --latest --title "Colab Pilot $TAG" --generate-notes
+          fi

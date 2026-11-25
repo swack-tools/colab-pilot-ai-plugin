@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#172033"/>
+      <stop offset="100%" stop-color="#0D121F"/>
+    </linearGradient>
+    <linearGradient id="amberGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FBBF24"/>
+      <stop offset="55%" stop-color="#F9AB00"/>
+      <stop offset="100%" stop-color="#EA580C"/>
+    </linearGradient>
+    <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7DD3FC"/>
+      <stop offset="100%" stop-color="#0284C7"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded squircle badge with ~12.5% (32px) transparent margin -->
+  <rect x="32" y="32" width="192" height="192" rx="44" fill="url(#bgGrad)" stroke="#2D3A5C" stroke-width="4"/>
+
+  <!-- Interlocking Colab-inspired infinity / accelerator rings -->
+  <g fill="none" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 102 96 A 32 32 0 1 0 102 160 C 122 160 134 96 154 96 A 32 32 0 1 1 154 160" stroke="url(#amberGrad)"/>
+    <path d="M 154 160 C 134 160 122 96 102 96" stroke="url(#amberGrad)" opacity="0.35"/>
+  </g>
+
+  <!-- Central GPU core diamond -->
+  <polygon points="128,110 144,128 128,146 112,128" fill="url(#cyanGrad)" stroke="#0D121F" stroke-width="3"/>
+
+  <!-- Telemetry pulse line along bottom -->
+  <polyline points="62,188 94,188 106,174 120,198 134,178 146,188 194,188"
+            fill="none" stroke="#38BDF8" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

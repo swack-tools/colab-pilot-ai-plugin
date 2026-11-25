@@ -1,0 +1,18 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "colab-pilot",
+  "displayName": "Colab Pilot",
+  "version": "1.0.0",
+  "description": "Zero-waste Google Colab orchestration: GPU cascade provisioning, 0-CU Drive staging, detached jobs, CU leak hooks, and live telemetry.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Open the Colab Pilot live dashboard and audit Compute Unit burn",
+    "Pre-stage training archives to Drive at 0 CU and launch a detached BF16 GPU job",
+    "Fan out a sharded CPU extraction job across 5 parallel Colab VMs"
+  ],
+  "author": {
+    "name": "Allen Swackhamer"
+  },
+  "repository": "https://github.com/swack-tools/colab-pilot-plugin",
+  "license": "Apache-2.0"
+}

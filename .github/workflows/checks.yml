@@ -1,0 +1,37 @@
+name: Checks
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: [self-hosted, Linux, X64, swack-tools]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Runner environment
+        run: |
+          uname -a
+          python3 --version
+          echo "Runner: ${RUNNER_NAME:-local-act}"
+
+      - name: Validate plugin contract
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/check_plugin.py
+
+      - name: Run unit and MCP protocol tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -v
+
+      - name: Verify deterministic release packaging
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/package_release.py "$RUNNER_TEMP/pkg1"
+          PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/package_release.py "$RUNNER_TEMP/pkg2"
+          diff -u "$RUNNER_TEMP/pkg1/SHA256SUMS" "$RUNNER_TEMP/pkg2/SHA256SUMS"

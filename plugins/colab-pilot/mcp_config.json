@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "pilot": {
+      "command": "python3",
+      "args": [
+        "-B",
+        "${PLUGIN_ROOT}/scripts/colab_mcp_server.py",
+        "--data-dir",
+        "${PLUGIN_DATA}"
+      ]
+    }
+  }
+}
