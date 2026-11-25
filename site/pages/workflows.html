@@ -1,0 +1,58 @@
+<p class="eyebrow">Operations &amp; safety</p>
+<h1>Guided workflows<span> and SRE guardrails</span></h1>
+<p class="lead">Every skill and hook enforces the same zero-waste discipline: validate locally first, stage large datasets at zero Compute Unit cost, run detached jobs, and verify zero burn on teardown.</p>
+
+<nav class="toc" aria-label="On this page">
+<a href="#protocol">6-phase protocol</a>
+<a href="#skills">Included skills</a>
+<a href="#operator-agent">Autonomous subagent</a>
+<a href="#hardware-rules">Hardware &amp; OOM rules</a>
+<a href="#watchdog">Watchdog &amp; alarm</a>
+</nav>
+
+<section id="protocol">
+<h2>The 6-phase zero-waste GPU protocol</h2>
+<ol>
+<li><strong>0-CU local gate:</strong> Validate archives, manifests, and Python syntax locally before renting any VM.</li>
+<li><strong>0-CU Drive pre-staging:</strong> Stage inputs larger than 24 MiB to Google Drive via <code>colab_smart_transfer</code> (<code>mode="drive_stage"</code>) with zero GPU burn.</li>
+<li><strong>BF16 GPU cascade:</strong> Call <code>colab_allocate_cascade</code> to try <code>A100-highmem → A100 → G4 → L4</code> and probe VRAM, System RAM, and <code>bf16_supported</code>.</li>
+<li><strong>Headless Drive mount:</strong> Mount Drive read-only on the VM via <code>colab_mount_rclone</code> with streaming or random-seek VFS presets.</li>
+<li><strong>Detached execution &amp; REST polling:</strong> Launch training with <code>colab_launch_detached</code> and monitor progress with <code>colab_poll_job</code> over REST.</li>
+<li><strong>Artifact pull &amp; verified teardown:</strong> Download outputs, call <code>colab_stop_all</code>, and confirm <code>Active assignments: 0</code> (<code>0.00/hr</code>).</li>
+</ol>
+</section>
+
+<section id="skills">
+<h2>Four specialized skills</h2>
+<div class="table-scroll">
+<table>
+<thead><tr><th>Skill</th><th>Claude / Antigravity</th><th>Codex</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>colab-pilot</code></td><td><code>/colab-pilot:colab-pilot</code></td><td><code>$colab-pilot</code></td><td>Open the live CU dashboard, audit sessions and one-fifth monthly budget pace, and sweep orphaned VMs.</td></tr>
+<tr><td><code>colab-train</code></td><td><code>/colab-pilot:colab-train</code></td><td><code>$colab-train</code></td><td>Execute the full 6-phase zero-waste GPU training runbook with OOM recovery and verified teardown.</td></tr>
+<tr><td><code>colab-shard-cpu</code></td><td><code>/colab-pilot:colab-shard-cpu</code></td><td><code>$colab-shard-cpu</code></td><td>Fan out extraction or preprocessing across parallel ~0.08 CU/hr CPU-only workers and merge shards.</td></tr>
+<tr><td><code>colab-watch</code></td><td><code>/colab-pilot:colab-watch</code></td><td><code>$colab-watch</code></td><td>Attach a stall, error, and VM-reachability watchdog with optional escalating macOS speech alarm.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="operator-agent">
+<h2>Autonomous <code>colab-operator</code> subagent</h2>
+<p>In Antigravity and compatible subagent hosts, delegate end-to-end training or multi-shard extraction to <code>colab-operator</code>. The agent follows <code>rules/AGENTS.md</code> automatically, negotiates GPU cascades, recovers from CUDA out-of-memory errors with <code>colab_reset_vram</code>, and guarantees zero orphaned VMs before returning.</p>
+</section>
+
+<section id="hardware-rules">
+<h2>Hardware &amp; OOM safety rules</h2>
+<ul>
+<li><strong>Check <code>bf16_supported</code> first:</strong> Do not enable <code>torch.bfloat16</code> on GPUs such as <code>T4</code> that lack native BF16 support.</li>
+<li><strong>Set <code>DataLoader(num_workers=0)</code> when caching in RAM:</strong> Avoids Linux <code>fork()</code> copy-on-write System RAM OOM-killer crashes on Colab VMs.</li>
+<li><strong>Flush zombie VRAM before retrying:</strong> Call <code>colab_reset_vram</code> after any CUDA OOM or exception to clear <code>sys.last_traceback</code> and IPython <code>Out</code> references.</li>
+<li><strong>Guard short-run EMA decay:</strong> Warm up exponential moving average decay with <code>min(0.9995, (1 + step) / (10 + step))</code>.</li>
+</ul>
+</section>
+
+<section id="watchdog">
+<h2>Detached watchdog &amp; escalating wakeup alarm</h2>
+<p>Long runs use <code>colab_launch_detached</code> (which wraps <code>nohup</code>, normalizes <code>\r</code> <code>tqdm</code> progress lines, and writes a 10-second GPU heartbeat JSON) paired with <code>scripts/colab_watchdog.py</code>. When a job finishes, stalls, or fails, <code>colab_wakeup_alarm</code> triggers a macOS multi-voice speech and accelerating chirp alert until acknowledged.</p>
+</section>

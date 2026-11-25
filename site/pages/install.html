@@ -1,0 +1,74 @@
+<p class="eyebrow">Setup &amp; authentication</p>
+<h1>Install in your<span> coding client</span></h1>
+<p class="lead">Colab Pilot ships multi-client manifests for Antigravity, Claude Code, Claude Desktop, and Codex, backed by a single local Python stdio MCP server.</p>
+
+<nav class="toc" aria-label="On this page">
+<a href="#quickstart">Requirements</a>
+<a href="#antigravity">Antigravity</a>
+<a href="#claude-code">Claude Code</a>
+<a href="#claude-desktop">Claude Desktop</a>
+<a href="#codex-cli">Codex CLI</a>
+<a href="#codex-desktop">Codex Desktop</a>
+<a href="#releases">Release ZIPs</a>
+<a href="#auth-and-rclone">Colab &amp; rclone auth</a>
+</nav>
+
+<section id="quickstart">
+<h2>Requirements</h2>
+<ul>
+<li><strong>Python 3.9 or later</strong> (stdlib-only MCP server and hooks; zero third-party Python packages required).</li>
+<li><strong><code>colab</code> command-line tool</strong> (<code>google-colab-cli</code>) authenticated with OAuth 2.0 or Application Default Credentials.</li>
+<li><strong>Optional <code>rclone</code></strong> configured locally for headless Google Drive pre-staging and streaming mounts.</li>
+</ul>
+</section>
+
+<section id="antigravity">
+<h2>Antigravity</h2>
+<p>Install directly from the public GitHub repository or from a downloaded release archive:</p>
+<pre><code>agy plugin install https://github.com/swack-tools/colab-pilot-plugin
+agy plugin enable colab-pilot</code></pre>
+<p>Invoke <code>/colab-pilot</code>, <code>/colab-train</code>, <code>/colab-shard-cpu</code>, or <code>/colab-watch</code>, or delegate full training runs to the <code>colab-operator</code> subagent.</p>
+</section>
+
+<section id="claude-code">
+<h2>Claude Code</h2>
+<p>Add the Swack Tools marketplace and install <code>colab-pilot</code> inside a Claude Code session:</p>
+<pre><code>/plugin marketplace add swack-tools/ai-plugin-marketplace
+/plugin install colab-pilot@swack-tools-community
+/colab-pilot:colab-pilot Check active Colab sessions and Compute Unit burn.</code></pre>
+</section>
+
+<section id="claude-desktop">
+<h2>Claude Desktop</h2>
+<p>Open <strong>Customize → Plugins → Add → Add marketplace → Add from GitHub</strong>, enter <code>swack-tools/ai-plugin-marketplace</code>, and install <strong>Colab Pilot</strong>. You can also upload <code>colab-pilot-claude.zip</code> from the <a href="#releases">verified releases</a>.</p>
+</section>
+
+<section id="codex-cli">
+<h2>Codex command-line tool</h2>
+<p>Register the Swack Tools marketplace and add <code>colab-pilot</code>:</p>
+<pre><code>codex plugin marketplace add https://github.com/swack-tools/ai-plugin-marketplace.git
+codex plugin add colab-pilot@swack-tools-community</code></pre>
+<p>Start a new Codex session and invoke <code>$colab-pilot</code>, <code>$colab-train</code>, <code>$colab-shard-cpu</code>, or <code>$colab-watch</code>.</p>
+</section>
+
+<section id="codex-desktop">
+<h2>Codex Desktop</h2>
+<p>Open <strong>Settings → Plugins → Marketplace</strong>, choose <strong>Add → Add plugin marketplace</strong>, enter <code>https://github.com/swack-tools/ai-plugin-marketplace.git</code>, and install <strong>Colab Pilot</strong>.</p>
+</section>
+
+<section id="releases">
+<h2>Verified release archives</h2>
+<p>Every tagged release publishes client-specific archives (<code>colab-pilot-claude.zip</code>, <code>colab-pilot-codex.zip</code>, and <code>colab-pilot-&lt;version&gt;.zip</code>) with a verified <code>SHA256SUMS</code> manifest:</p>
+<pre><code>gh release download --repo swack-tools/colab-pilot-plugin --pattern '*.zip' --pattern 'SHA256SUMS'
+shasum -a 256 -c SHA256SUMS --ignore-missing</code></pre>
+<p><a href="https://github.com/swack-tools/colab-pilot-plugin/releases/latest">Browse latest release artifacts on GitHub ↗</a></p>
+</section>
+
+<section id="auth-and-rclone">
+<h2>Authenticate Colab and headless rclone</h2>
+<p>Never run interactive TTY commands such as <code>colab drivemount</code> or <code>colab auth</code> inside an agent session. Authenticate <code>colab</code> and configure your <code>rclone</code> remote once in your own terminal before delegating GPU runs:</p>
+<pre><code>colab auth login
+rclone config   # create a Google Drive remote, e.g. "gdrive"
+rclone lsd gdrive:</code></pre>
+<p>Once <code>rclone.conf</code> exists locally, <code>colab_mount_rclone</code> copies it to the allocated Colab VM and mounts Drive read-only with tuned VFS flags without triggering browser OAuth 2.0 prompts.</p>
+</section>

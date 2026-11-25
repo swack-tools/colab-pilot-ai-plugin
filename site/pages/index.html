@@ -1,0 +1,54 @@
+<p class="eyebrow">ANTIGRAVITY + CLAUDE + CODEX · ZERO-WASTE COLAB SRE</p>
+<h1>Run GPU workloads<br><span>without wasted credits</span></h1>
+<p class="eyebrow">Four guided skills · 10 MCP tools · 3 lifecycle guardrails · live telemetry UI</p>
+<p class="lead">Orchestrate Google Colab GPUs and parallel CPU shards from Antigravity, Claude Code, and Codex. Pre-stage datasets to Google Drive at zero Compute Unit cost, launch WebSocket-proof detached jobs, and prevent orphaned VM burn.</p>
+<div class="actions"><a class="button" href="install.html">Install in your client <span aria-hidden="true">→</span></a><a class="button secondary" href="reference.html">Explore the reference</a></div>
+<div class="facts"><span>0-CU Google Drive pre-staging</span><span>WebSocket-proof detached jobs</span><span>Zero-orphan Stop guardrails</span></div>
+
+<section aria-labelledby="capabilities">
+<h2 id="capabilities">Built for unattended Colab runs</h2>
+<div class="cards">
+<article><span class="number">01 / DASHBOARD</span><h3>Inspect live telemetry</h3><p><code>/colab-pilot Check active Colab sessions and Compute Unit burn.</code></p><p class="muted">Review Compute Unit balance, one-fifth monthly budget pace, active runtimes, and detached jobs.</p></article>
+<article><span class="number">02 / GPU CASCADE</span><h3>Negotiate BF16 tiers</h3><p><code>Allocate a BF16 GPU session trying A100-highmem, A100, G4, and L4.</code></p><p class="muted">Probe VRAM, System RAM, and BF16 support before sizing DataLoader workers.</p></article>
+<article><span class="number">03 / DRIVE STAGING</span><h3>Stage archives at 0 CU</h3><p><code>Pre-stage dataset.tar to Google Drive before renting a GPU VM.</code></p><p class="muted">Copy `rclone` configuration headlessly without interactive OAuth 2.0 prompts or >24 MiB hangs.</p></article>
+<article><span class="number">04 / DETACHED JOBS</span><h3>Survive WebSocket drops</h3><p><code>Launch train.py detached and poll status over REST.</code></p><p class="muted">Run under <code>nohup</code> with carriage-return log normalization and 10-second GPU heartbeats.</p></article>
+<article><span class="number">05 / CPU SHARDING</span><h3>Fan out CPU extraction</h3><p><code>/colab-shard-cpu Run extraction across 5 CPU-only workers.</code></p><p class="muted">Provision isolated ~0.08 CU/hr CPU VMs, shard manifests, and merge tar outputs.</p></article>
+<article><span class="number">06 / GUARDRAILS</span><h3>Stop Compute Unit leaks</h3><p><code>PreToolUse + Stop hooks + colab_wakeup_alarm</code></p><p class="muted">Block TTY-hanging CLI calls, large direct uploads, and ending turns with unleased VMs.</p></article>
+</div>
+</section>
+
+<section class="split" aria-labelledby="why-pilot">
+<div>
+<p class="eyebrow">Why Colab runs burn credits</p>
+<h2 id="why-pilot">Stop losing Compute Units<br>to silent failures</h2>
+<p>Interactive Colab sessions drop WebSockets after roughly five minutes, freeze on carriage-return progress bars, and waste expensive GPU time when multi-gigabyte uploads run after allocation instead of staging to Drive first.</p>
+<p>Colab Pilot replaces fragile interactive shells with deterministic REST polling, pre-execution safety hooks, CUDA traceback cleanup after out-of-memory failures, and verified zero-burn teardown checks.</p>
+</div>
+<aside class="callout">
+<h3>Three steps to zero-waste runs</h3>
+<ol>
+<li>Install Colab Pilot in Antigravity, Claude, or Codex.</li>
+<li>Authenticate <code>colab</code> and configure headless <code>rclone</code>.</li>
+<li>Stage archives at 0 CU, then launch a detached cascade run.</li>
+</ol>
+<a href="install.html#quickstart">Follow the quickstart walkthrough →</a>
+</aside>
+</section>
+
+<section aria-labelledby="choose-client">
+<h2 id="choose-client">Choose your client</h2>
+<div class="link-grid">
+<a href="install.html#antigravity">Antigravity <span>Plugin CLI, MCP App UI, and subagent →</span></a>
+<a href="install.html#claude-code">Claude Code <span>Marketplace slash commands and hooks →</span></a>
+<a href="install.html#claude-desktop">Claude Desktop <span>Marketplace or ZIP upload →</span></a>
+<a href="install.html#codex-cli">Codex command-line <span>Marketplace + $colab-pilot skills →</span></a>
+<a href="install.html#codex-desktop">Codex Desktop <span>Plugin marketplace install →</span></a>
+<a href="install.html#releases">Release archives <span>Verified SHA-256 ZIP downloads →</span></a>
+</div>
+</section>
+
+<section class="callout">
+<h2>Interactive dashboard and autonomous SRE</h2>
+<p>Colab Pilot bundles an interactive MCP App dashboard (<code>ui://colab-pilot/dashboard.html</code>) alongside the autonomous <code>colab-operator</code> subagent so you can track GPU burn, detached job progress, and alarm leases in one view.</p>
+<p><a href="workflows.html">Read the 6-phase training protocol and guardrails →</a></p>
+</section>

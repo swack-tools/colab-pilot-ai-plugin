@@ -1,0 +1,70 @@
+<p class="eyebrow">API, hooks, and packaging</p>
+<h1>Technical<span> reference</span></h1>
+<p class="lead">Complete specification of the 10 <code>pilot</code> MCP tools, lifecycle hooks, interactive MCP App UI, state files, and deterministic release packaging.</p>
+
+<nav class="toc" aria-label="On this page">
+<a href="#mcp-tools">MCP tools</a>
+<a href="#hooks">Lifecycle hooks</a>
+<a href="#dashboard-ui">Dashboard UI</a>
+<a href="#architecture">State &amp; layout</a>
+<a href="#ci-and-packaging">CI &amp; packaging</a>
+</nav>
+
+<section id="mcp-tools">
+<h2><code>pilot</code> MCP server tools</h2>
+<p>The bundled local stdio server (<code>scripts/colab_pilot_mcp.py</code>) exposes 10 tools and the interactive dashboard resource:</p>
+<div class="table-scroll">
+<table>
+<thead><tr><th>Tool</th><th>Purpose</th><th>Key behavior</th></tr></thead>
+<tbody>
+<tr><td><code>colab_dashboard</code></td><td>Live CU &amp; session telemetry</td><td>Reads <code>colab usage</code>, active sessions, detached jobs, keep-warm leases, and alarm state.</td></tr>
+<tr><td><code>colab_allocate_cascade</code></td><td>BF16 GPU cascade allocation</td><td>Tries tiers in priority order, probes GPU/VRAM/RAM/BF16, and recommends safe worker counts.</td></tr>
+<tr><td><code>colab_mount_rclone</code></td><td>Headless Google Drive mount</td><td>Copies local <code>rclone.conf</code> and mounts Drive read-only with streaming or random-seek tuning.</td></tr>
+<tr><td><code>colab_smart_transfer</code></td><td>Zero-waste archive transfer</td><td>Direct upload ≤24 MiB; Drive staging or verified 24 MiB chunked upload for larger files.</td></tr>
+<tr><td><code>colab_launch_detached</code></td><td>WebSocket-proof job launcher</td><td>Runs Python scripts under <code>nohup</code> with log normalization and 10-second GPU heartbeat JSON.</td></tr>
+<tr><td><code>colab_poll_job</code></td><td>REST job &amp; log poller</td><td>Fetches job status JSON and recent log lines over REST without holding a WebSocket open.</td></tr>
+<tr><td><code>colab_reset_vram</code></td><td>Zombie CUDA memory flush</td><td>Clears tracebacks, IPython <code>Out</code> caches, and PyTorch CUDA cache, reporting before/after VRAM.</td></tr>
+<tr><td><code>colab_keep_warm</code></td><td>Timed keep-warm lease</td><td>Registers or clears a timed lease so the <code>Stop</code> hook permits ending the turn intentionally.</td></tr>
+<tr><td><code>colab_stop_all</code></td><td>Verified VM teardown</td><td>Stops one named session or every active session, clears leases, and verifies <code>0.00/hr</code> burn.</td></tr>
+<tr><td><code>colab_wakeup_alarm</code></td><td>Escalating completion alarm</td><td>Starts, stops, inspects, or self-tests multi-voice macOS TTS + chirp synthesis.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="hooks">
+<h2>Lifecycle hooks (<code>hooks.json</code>)</h2>
+<div class="table-scroll">
+<table>
+<thead><tr><th>Event</th><th>Trigger</th><th>Enforcement</th></tr></thead>
+<tbody>
+<tr><td><code>SessionStart</code></td><td>New session startup</td><td>Injects a concise summary of active Colab VMs and current Compute Unit burn rate.</td></tr>
+<tr><td><code>PreToolUse</code></td><td>Shell tool invocation</td><td>Blocks TTY-hanging <code>colab drivemount</code>/<code>auth</code>/<code>pay</code>/<code>repl</code>, invalid <code>--gpu</code> tiers, and <code>&gt;30 MiB</code> direct <code>colab upload</code>.</td></tr>
+<tr><td><code>Stop</code></td><td>End of agent turn</td><td>Blocks stopping while an unleased Colab VM remains allocated with no running detached job.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="dashboard-ui">
+<h2>Interactive MCP App UI</h2>
+<p><code>colab_dashboard</code> renders <code>ui://colab-pilot/dashboard.html</code> (<code>plugins/colab-pilot/assets/dashboard.html</code>) in MCP App-capable clients, displaying real-time Compute Unit balance, one-fifth monthly budget pacing, active VM assignments, detached job logs, and one-click alarm or teardown controls.</p>
+</section>
+
+<section id="architecture">
+<h2>State &amp; repository layout</h2>
+<ul>
+<li><strong>Local state directory:</strong> <code>~/.colab-pilot/</code> stores keep-warm leases, alarm state, and cached telemetry snapshots (override with <code>COLAB_PILOT_STATE_DIR</code>).</li>
+<li><strong>Plugin root:</strong> <code>plugins/colab-pilot/</code> holds <code>.antigravity-plugin/</code>, <code>.claude-plugin/</code>, <code>.codex-plugin/</code>, <code>skills/</code>, <code>agents/</code>, <code>rules/</code>, <code>hooks/</code>, <code>scripts/</code>, and <code>assets/</code>.</li>
+<li><strong>Catalog &amp; API metadata:</strong> <code>catalog-info.json</code> and <code>api/colab-pilot/tools.json</code> provide machine-readable capability specs for the <a href="https://ai.swacktech.com/plugins/colab-pilot/">Swack Tools Marketplace</a>.</li>
+</ul>
+</section>
+
+<section id="ci-and-packaging">
+<h2>Local CI &amp; deterministic packaging</h2>
+<p>Validate manifests, run unit and MCP protocol tests, build the documentation site, and verify deterministic release archives locally:</p>
+<pre><code>python3 scripts/check_plugin.py
+python3 -m unittest discover -s tests -v
+python3 scripts/package_release.py dist
+python3 site/build.py build/site &amp;&amp; python3 site/check.py build/site</code></pre>
+</section>
