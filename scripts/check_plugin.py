@@ -50,7 +50,7 @@ logo_path = PLUGIN / "assets" / "logo.svg"
 check(logo_path.is_file() and "<svg" in logo_path.read_text(encoding="utf-8"), "assets/logo.svg missing or invalid")
 
 dash_path = PLUGIN / "assets" / "dashboard.html"
-check(dash_path.is_file() and 10_000 < dash_path.stat().st_size < 10 * 1024 * 1024, "assets/dashboard.html missing or bad size")
+check(dash_path.is_file() and 5_000 < dash_path.stat().st_size < 256 * 1024, "assets/dashboard.html missing or exceeds 256 KiB limit")
 
 check((PLUGIN / "rules" / "AGENTS.md").is_file(), "rules/AGENTS.md missing")
 agent_path = PLUGIN / "agents" / "colab-operator.md"

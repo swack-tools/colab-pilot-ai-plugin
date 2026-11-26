@@ -26,7 +26,7 @@ MAX_DIRECT_UPLOAD_BYTES = 30 * 1024 * 1024
 
 
 def _data_dir() -> Path:
-    raw = os.environ.get("PLUGIN_DATA", "").strip()
+    raw = (os.environ.get("CLAUDE_PLUGIN_DATA") or os.environ.get("PLUGIN_DATA") or "").strip()
     if raw:
         return Path(raw)
     return Path.home() / ".cache" / "colab-pilot"

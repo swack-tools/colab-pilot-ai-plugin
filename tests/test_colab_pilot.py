@@ -274,6 +274,7 @@ class ColabPilotTests(unittest.TestCase):
             self.assertEqual(chirp["voice"], "Samantha (English (US))")
 
     def test_deterministic_packaging(self) -> None:
+        import zipfile
         pkg = _load_module("package_release", ROOT / "scripts" / "package_release.py")
         d1 = self.tmp_path / "dist1"
         d2 = self.tmp_path / "dist2"
@@ -281,6 +282,10 @@ class ColabPilotTests(unittest.TestCase):
         c2 = pkg.build_release(d2)
         self.assertEqual(c1, c2)
         self.assertEqual((d1 / "SHA256SUMS").read_text(), (d2 / "SHA256SUMS").read_text())
+        self.assertLess((PLUGIN_DIR / "assets" / "dashboard.html").stat().st_size, 256 * 1024)
+        for zname in ("colab-pilot-1.3.2.zip", "colab-pilot-claude.zip", "colab-pilot-codex.zip"):
+            with zipfile.ZipFile(d1 / zname) as zf:
+                self.assertIn(".mcp.json", zf.namelist(), f".mcp.json missing in {zname}")
 
     def test_async_drive_stage_transfer_and_concurrent_dashboard(self) -> None:
         rclone_conf = self.home_dir / ".config" / "rclone" / "colab_gdrive_root.conf"
@@ -703,7 +708,7 @@ elif cmd == "sessions":
             )
             self.assertEqual(res.returncode, 0, f"{mode}: {res.stderr}")
             by_id = {m["id"]: m for m in (json.loads(ln) for ln in res.stdout.splitlines() if ln.strip())}
-            self.assertEqual(by_id[1]["result"]["serverInfo"]["version"], "1.3.1")
+            self.assertEqual(by_id[1]["result"]["serverInfo"]["version"], "1.3.2")
             tool_names = [t["name"] for t in by_id[2]["result"]["tools"]]
             self.assertIn("colab_dashboard", tool_names)
 

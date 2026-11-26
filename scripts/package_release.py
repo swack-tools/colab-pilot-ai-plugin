@@ -19,7 +19,7 @@ FIXED_ZIP_DT = (2026, 1, 1, 0, 0, 0)
 FORBIDDEN_PARTS = {"__pycache__", ".DS_Store", ".data", ".env", "node_modules"}
 
 CLIENT_EXCLUDES = {
-    "antigravity": {".antigravity-plugin", ".claude-plugin", ".codex-plugin", ".mcp.json", "hooks"},
+    "antigravity": {".antigravity-plugin", ".claude-plugin", ".codex-plugin"},
     "claude": {".antigravity-plugin", ".codex-plugin", "mcp_config.json", "hooks.json", "agents", "rules"},
     "codex": {".antigravity-plugin", ".claude-plugin", "mcp_config.json", "hooks.json", "agents", "rules"},
 }

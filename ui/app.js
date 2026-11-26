@@ -2,9 +2,9 @@ import {
   App,
   applyDocumentTheme,
   applyHostStyleVariables,
-} from '@modelcontextprotocol/ext-apps';
+} from './mcp-app-client.js';
 
-const app = new App({ name: 'Colab Pilot', version: '1.3.1' }, {});
+const app = new App({ name: 'Colab Pilot', version: '1.3.2' }, {});
 let currentState = null;
 let busyAction = '';
 let receivedInitialResult = false;

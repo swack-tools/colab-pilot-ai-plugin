@@ -1916,6 +1916,7 @@ TOOLS: list[dict[str, Any]] = [
         },
         "_meta": {
             "ui": {"resourceUri": APP_URI, "visibility": ["model", "app"]},
+            "ui/resourceUri": APP_URI,
             "com.google.antigravity/ui": {
                 "entrypoints": [
                     {"type": "aux_pane", "title": "Colab Pilot"},
@@ -2103,7 +2104,7 @@ def _handle_request(req: dict[str, Any], data_dir: Path) -> None:
                             "tools": {"listChanged": False},
                             "resources": {"subscribe": False, "listChanged": False},
                         },
-                        "serverInfo": {"name": "colab-pilot", "version": "1.3.1"},
+                        "serverInfo": {"name": "colab-pilot", "version": "1.3.2"},
                     },
                 }
             )
@@ -2204,8 +2205,13 @@ def _handle_request(req: dict[str, Any], data_dir: Path) -> None:
 
 
 def main() -> int:
+    default_data_dir = (
+        os.environ.get("CLAUDE_PLUGIN_DATA")
+        or os.environ.get("PLUGIN_DATA")
+        or str(Path.home() / ".cache" / "colab-pilot")
+    )
     p = argparse.ArgumentParser(description="Colab Pilot MCP Server")
-    p.add_argument("--data-dir", default=str(Path.home() / ".cache" / "colab-pilot"))
+    p.add_argument("--data-dir", default=default_data_dir)
     p.add_argument("--keepalive-daemon", action="store_true")
     p.add_argument("--interval", type=float, default=float(os.environ.get("COLAB_KEEPALIVE_INTERVAL_SEC", "150") or 150))
     p.add_argument("--transfer-worker", type=Path)
