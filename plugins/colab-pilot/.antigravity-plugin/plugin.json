@@ -14,6 +14,6 @@
   "author": {
     "name": "Allen Swackhamer"
   },
-  "repository": "https://github.com/swack-tools/colab-pilot-plugin",
+  "repository": "https://github.com/swack-tools/colab-pilot-ai-plugin",
   "license": "Apache-2.0"
 }

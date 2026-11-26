@@ -76,15 +76,15 @@ def render_shell(slug: str, title: str, description: str, body: str) -> str:
         f'<a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">⚡</span>Colab Pilot</a>'
         f'<nav aria-label="Main navigation">{nav_links}'
         f'<a href="https://ai.swacktech.com/plugins/colab-pilot/">Marketplace ↗</a>'
-        f'<a href="https://github.com/swack-tools/colab-pilot-plugin">GitHub ↗</a></nav>'
+        f'<a href="https://github.com/swack-tools/colab-pilot-ai-plugin">GitHub ↗</a></nav>'
         f"</div></header>"
         f'<main id="main">{body}</main>'
         f'<footer><div><a class="brand" href="index.html">Colab Pilot</a>'
         f"<p>Zero-waste Google Colab orchestration for AI coding agents.</p></div>"
         f'<p><a href="https://ai.swacktech.com/plugins/colab-pilot/">Swack Tools Marketplace</a> · '
-        f'<a href="https://github.com/swack-tools/colab-pilot-plugin">Source on GitHub</a> · '
-        f'<a href="https://github.com/swack-tools/colab-pilot-plugin/releases/latest">Releases</a> · '
-        f'<a href="https://github.com/swack-tools/colab-pilot-plugin/blob/main/LICENSE">Apache-2.0 License</a><br>'
+        f'<a href="https://github.com/swack-tools/colab-pilot-ai-plugin">Source on GitHub</a> · '
+        f'<a href="https://github.com/swack-tools/colab-pilot-ai-plugin/releases/latest">Releases</a> · '
+        f'<a href="https://github.com/swack-tools/colab-pilot-ai-plugin/blob/main/LICENSE">Apache-2.0 License</a><br>'
         f"Community project by Swack Tools. Not affiliated with Google, Anthropic, or OpenAI.</p></footer>"
         f"</body></html>\n"
     )

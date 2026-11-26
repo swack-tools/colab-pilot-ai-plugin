@@ -9,7 +9,7 @@ ARG NODE_SHA256_ARM64=6e51a2ada00f0011cc266f65d98922b403d7ad88f809ca2aa615a5fe1c
 
 LABEL org.opencontainers.image.title="Colab Pilot Dev & CI Container" \
       org.opencontainers.image.description="Multi-arch Ubuntu 24.04 development and GitHub Actions replay container for Colab Pilot." \
-      org.opencontainers.image.source="https://github.com/swack-tools/colab-pilot-plugin" \
+      org.opencontainers.image.source="https://github.com/swack-tools/colab-pilot-ai-plugin" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]

@@ -25,7 +25,7 @@
 <section id="antigravity">
 <h2>Antigravity</h2>
 <p>Install directly from the public GitHub repository or from a downloaded release archive:</p>
-<pre><code>agy plugin install https://github.com/swack-tools/colab-pilot-plugin
+<pre><code>agy plugin install https://github.com/swack-tools/colab-pilot-ai-plugin
 agy plugin enable colab-pilot</code></pre>
 <p>Invoke <code>/colab-pilot</code>, <code>/colab-train</code>, <code>/colab-shard-cpu</code>, or <code>/colab-watch</code>, or delegate full training runs to the <code>colab-operator</code> subagent.</p>
 </section>
@@ -59,9 +59,9 @@ codex plugin add colab-pilot@swack-tools-community</code></pre>
 <section id="releases">
 <h2>Verified release archives</h2>
 <p>Every tagged release publishes client-specific archives (<code>colab-pilot-claude.zip</code>, <code>colab-pilot-codex.zip</code>, and <code>colab-pilot-&lt;version&gt;.zip</code>) with a verified <code>SHA256SUMS</code> manifest:</p>
-<pre><code>gh release download --repo swack-tools/colab-pilot-plugin --pattern '*.zip' --pattern 'SHA256SUMS'
+<pre><code>gh release download --repo swack-tools/colab-pilot-ai-plugin --pattern '*.zip' --pattern 'SHA256SUMS'
 shasum -a 256 -c SHA256SUMS --ignore-missing</code></pre>
-<p><a href="https://github.com/swack-tools/colab-pilot-plugin/releases/latest">Browse latest release artifacts on GitHub ↗</a></p>
+<p><a href="https://github.com/swack-tools/colab-pilot-ai-plugin/releases/latest">Browse latest release artifacts on GitHub ↗</a></p>
 </section>
 
 <section id="auth-and-rclone">
