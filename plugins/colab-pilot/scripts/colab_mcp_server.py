@@ -19,18 +19,24 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 APP_URI = "ui://colab-pilot/dashboard.html"
 VALID_TIERS = {"A100-highmem", "A100", "G4", "L4", "H100", "T4", "NONE"}
+RESOURCES_TTL_SEC = 8.0
 _SEND_LOCK = threading.Lock()
 _STATE_FILE_LOCK = threading.Lock()
 _ACTIVE_OPS_LOCK = threading.Lock()
 _ACTIVE_OPS: dict[str, dict[str, Any]] = {}
+_RESOURCES_CACHE_LOCK = threading.Lock()
+_RESOURCES_MEM_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 def _plugin_root() -> Path:
@@ -212,6 +218,176 @@ def _unassign_endpoint(endpoint: str) -> None:
         raise RuntimeError((res.stderr or res.stdout or f"unassign failed ({res.returncode})").strip())
 
 
+def _parse_colab_resources_payload(raw_resources: str, raw_kernels: str = "") -> dict[str, Any]:
+    txt = (raw_resources or "").lstrip()
+    if txt.startswith(")]}'"):
+        txt = txt[4:].lstrip()
+    data = json.loads(txt) if txt else {}
+    out: dict[str, Any] = {}
+
+    mem = data.get("memory") if isinstance(data.get("memory"), dict) else {}
+    mem_tot = int(mem.get("totalBytes") or 0)
+    mem_free = int(mem.get("freeBytes") or 0)
+    if mem_tot > 0:
+        mem_used = max(0, mem_tot - mem_free)
+        out["ram_total_gb"] = round(mem_tot / (1024**3), 1)
+        out["ram_used_gb"] = round(mem_used / (1024**3), 1)
+        out["ram_pct"] = round((mem_used * 100.0) / mem_tot, 1)
+
+    gpus = data.get("gpus") if isinstance(data.get("gpus"), list) else []
+    if gpus and isinstance(gpus[0], dict):
+        g = gpus[0]
+        raw_gu = float(g.get("gpuUtilization", 0.0) or 0.0)
+        raw_mu = float(g.get("memoryUtilization", 0.0) or 0.0)
+        gu_pct = raw_gu if raw_gu > 1.0 else raw_gu * 100.0
+        mu_pct = raw_mu if raw_mu > 1.0 else raw_mu * 100.0
+        v_used = int(g.get("memoryUsedBytes") or 0)
+        v_tot = int(g.get("memoryTotalBytes") or 0)
+        out["gpu_name"] = g.get("name")
+        out["gpu_util_pct"] = round(min(100.0, max(0.0, gu_pct)), 1)
+        out["gpu_mem_util_pct"] = round(min(100.0, max(0.0, mu_pct)), 1)
+        if v_tot > 0:
+            out["vram_total_gb"] = round(v_tot / (1024**3), 1)
+            out["vram_used_gb"] = round(max(0, v_used) / (1024**3), 1)
+            out["vram_pct"] = round((max(0, v_used) * 100.0) / v_tot, 1)
+        out["gpu_ever_used"] = bool(g.get("everUsed", False))
+
+    disks = data.get("disks") if isinstance(data.get("disks"), list) else []
+    chosen_disk = None
+    for d in disks:
+        if isinstance(d, dict) and isinstance(d.get("filesystem"), dict):
+            if d["filesystem"].get("label") == "kernel":
+                chosen_disk = d["filesystem"]
+                break
+    if chosen_disk is None and disks and isinstance(disks[0], dict) and isinstance(disks[0].get("filesystem"), dict):
+        chosen_disk = disks[0]["filesystem"]
+    if chosen_disk:
+        d_tot = int(chosen_disk.get("totalBytes") or 0)
+        d_used = int(chosen_disk.get("usedBytes") or 0)
+        if d_tot > 0:
+            out["disk_total_gb"] = round(d_tot / (1024**3), 1)
+            out["disk_used_gb"] = round(max(0, d_used) / (1024**3), 1)
+            out["disk_pct"] = round((max(0, d_used) * 100.0) / d_tot, 1)
+
+    if raw_kernels:
+        try:
+            klist = json.loads(raw_kernels)
+            if isinstance(klist, list):
+                out["kernel_count"] = len(klist)
+                if klist:
+                    is_busy = any(isinstance(k, dict) and k.get("execution_state") == "busy" for k in klist)
+                    out["kernel_state"] = "busy" if is_busy else "idle"
+        except Exception:
+            pass
+
+    return out
+
+
+def _http_get_runtime_proxy(proxy_url: str, token: str, subpath: str, timeout: float = 2.2) -> str:
+    req = urllib.request.Request(
+        f"{proxy_url.rstrip('/')}{subpath}",
+        headers={
+            "X-Colab-Runtime-Proxy-Token": token,
+            "X-Colab-Client-Agent": "colab-cli",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _fetch_single_vm_http_resources(endpoint: str, proxy_url: str, token: str) -> dict[str, Any] | None:
+    if not endpoint or not proxy_url or not token:
+        return None
+    now = time.monotonic()
+    with _RESOURCES_CACHE_LOCK:
+        cached = _RESOURCES_MEM_CACHE.get(endpoint)
+        if cached and (now - cached[0]) < RESOURCES_TTL_SEC:
+            return dict(cached[1])
+    try:
+        raw_res = _http_get_runtime_proxy(proxy_url, token, "/api/colab/resources", timeout=2.2)
+    except Exception:
+        return None
+    raw_kernels = ""
+    try:
+        raw_kernels = _http_get_runtime_proxy(proxy_url, token, "/api/kernels", timeout=1.5)
+    except Exception:
+        pass
+    try:
+        parsed = _parse_colab_resources_payload(raw_res, raw_kernels)
+    except Exception:
+        return None
+    with _RESOURCES_CACHE_LOCK:
+        _RESOURCES_MEM_CACHE[endpoint] = (time.monotonic(), dict(parsed))
+    return parsed
+
+
+def _token_looks_valid(expires_at_iso: Any) -> bool:
+    if not expires_at_iso:
+        return True
+    try:
+        dt = datetime.fromisoformat(str(expires_at_iso).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (dt - datetime.now(timezone.utc)).total_seconds() > 120.0
+    except Exception:
+        return True
+
+
+def _fetch_proxy_tokens_fallback(data_dir: Path) -> dict[str, dict[str, str]]:
+    cache_path = data_dir / "proxy_tokens_cache.json"
+    cached = _read_json(cache_path, {})
+    now = time.time()
+    if isinstance(cached, dict) and (now - float(cached.get("updated_at") or 0)) < 300.0:
+        tokens = cached.get("tokens")
+        if isinstance(tokens, dict):
+            return tokens
+    try:
+        colab_bin = Path(_resolve_colab_bin())
+        if "colab_cli" not in colab_bin.read_text(encoding="utf-8", errors="ignore"):
+            return {}
+        py_bin = _colab_python_bin()
+        res = subprocess.run(
+            [
+                py_bin,
+                "-B",
+                "-c",
+                "import json; from colab_cli.common import state; "
+                "print(json.dumps({a.endpoint: {'url': a.runtime_proxy_info.url, 'token': a.runtime_proxy_info.token} "
+                "for a in state.client.list_assignments() if a.runtime_proxy_info}))",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=3.5,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            tokens = json.loads(res.stdout.strip())
+            if isinstance(tokens, dict):
+                _write_json(cache_path, {"updated_at": now, "tokens": tokens})
+                return tokens
+    except Exception:
+        pass
+    return {}
+
+
+def _record_vm_cpu_telemetry(data_dir: Path, session: str, payload: dict[str, Any]) -> None:
+    if not session or payload.get("cpu_pct") is None:
+        return
+    path = data_dir / "vm_telemetry.json"
+    cur = _read_json(path, {})
+    if not isinstance(cur, dict):
+        cur = {}
+    cur[session] = {
+        "cpu_pct": payload.get("cpu_pct"),
+        "cpu_count": payload.get("cpu_count"),
+        "load_1m": payload.get("load_1m"),
+        "sampled_at": float(payload.get("sampled_at") or time.time()),
+        "source": str(payload.get("source") or "probe"),
+    }
+    _write_json(path, cur)
+
+
 def _get_leases(data_dir: Path) -> dict[str, dict[str, Any]]:
     raw = _read_json(data_dir / "kept_sessions.json", {})
     if not isinstance(raw, dict):
@@ -324,11 +500,26 @@ def _run_keepalive_tick(data_dir: Path) -> bool:
                             "state": st_obj.get("state", "running"),
                             "gpu_util": st_obj.get("gpu_util"),
                             "vram_used": st_obj.get("vram_used"),
+                            "cpu_pct": st_obj.get("cpu_pct"),
+                            "cpu_count": st_obj.get("cpu_count"),
+                            "load_1m": st_obj.get("load_1m"),
                             "exit_code": st_obj.get("exit_code"),
                             "last_drive_sync_ts": st_obj.get("last_drive_sync_ts"),
                             "synced_file_count": st_obj.get("synced_file_count"),
                         }
                     )
+                    if st_obj.get("cpu_pct") is not None:
+                        _record_vm_cpu_telemetry(
+                            data_dir,
+                            sess,
+                            {
+                                "cpu_pct": st_obj.get("cpu_pct"),
+                                "cpu_count": st_obj.get("cpu_count"),
+                                "load_1m": st_obj.get("load_1m"),
+                                "sampled_at": st_obj.get("heartbeat_ts") or time.time(),
+                                "source": "detached_job",
+                            },
+                        )
                     jobs_dirty = True
             except Exception:
                 pass
@@ -387,16 +578,42 @@ def _run_keepalive_tick(data_dir: Path) -> bool:
             _run_colab(["ls", "-s", sess, "content"], timeout=20)
         except Exception:
             pass
-        is_busy = bool((local_sessions.get(sess) or {}).get("running")) if isinstance(local_sessions.get(sess), dict) else False
-        if not is_busy:
+        sess_meta = local_sessions.get(sess) if isinstance(local_sessions.get(sess), dict) else {}
+        is_busy = bool(sess_meta.get("running"))
+        if not is_busy and sess_meta.get("url") and sess_meta.get("token"):
             try:
-                subprocess.run(
+                raw_k = _http_get_runtime_proxy(str(sess_meta["url"]), str(sess_meta["token"]), "/api/kernels", timeout=1.5)
+                klist = json.loads(raw_k)
+                if isinstance(klist, list) and any(isinstance(k, dict) and k.get("execution_state") == "busy" for k in klist):
+                    is_busy = True
+            except Exception:
+                pass
+        if not is_busy:
+            cpu_probe = (
+                "import json, os, time\n"
+                "def _rd():\n"
+                "    p = [int(x) for x in open('/proc/stat').readline().split()[1:]]\n"
+                "    return sum(p), p[3] + (p[4] if len(p) > 4 else 0)\n"
+                "t0, i0 = _rd(); time.sleep(0.2); t1, i1 = _rd()\n"
+                "print('KA_CPU:' + json.dumps({'cpu_pct': round(100.0 * (1.0 - (i1 - i0) / max(1, t1 - t0)), 1), "
+                "'cpu_count': os.cpu_count(), 'load_1m': round(os.getloadavg()[0], 2)}))\n"
+            )
+            try:
+                ex_res = subprocess.run(
                     [_resolve_colab_bin(), "exec", "-s", sess],
-                    input="pass\n",
+                    input=cpu_probe,
                     capture_output=True,
                     text=True,
                     timeout=20,
                 )
+                if ex_res.returncode == 0 and ex_res.stdout:
+                    for ln in ex_res.stdout.splitlines():
+                        if ln.startswith("KA_CPU:"):
+                            cpu_obj = json.loads(ln.split("KA_CPU:", 1)[1])
+                            cpu_obj["sampled_at"] = time.time()
+                            cpu_obj["source"] = "keepalive"
+                            _record_vm_cpu_telemetry(data_dir, sess, cpu_obj)
+                            break
             except Exception:
                 pass
         prev_p = pings.get(sess) if isinstance(pings.get(sess), dict) else {}
@@ -419,7 +636,7 @@ def _run_keepalive_tick(data_dir: Path) -> bool:
 
 def _run_keepalive_daemon(data_dir: Path, interval: float) -> int:
     interval = max(0.1, float(interval))
-    initial_wait = min(interval, 0.25 if interval < 5.0 else 5.0)
+    initial_wait = min(interval, 0.25 if interval < 5.0 else 1.5)
     time.sleep(initial_wait)
     while True:
         try:
@@ -626,17 +843,29 @@ def tool_colab_dashboard(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]
     ultra_monthly_cu = float(args.get("ultra_monthly_cu", 25000.0) or 25000.0)
     budget_fraction = float(args.get("budget_fraction", 0.20) or 0.20)
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        f_usage = pool.submit(_parse_usage, data_dir)
-        f_sessions = pool.submit(_fetch_sessions_safe)
-        f_alarm = pool.submit(_fetch_alarm_status)
-        usage = f_usage.result()
-        server_sessions = f_sessions.result()
-        alarm_status = f_alarm.result()
-
     local_sessions = _read_json(_sessions_file(), {})
     if not isinstance(local_sessions, dict):
         local_sessions = {}
+
+    http_futures: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        f_usage = pool.submit(_parse_usage, data_dir)
+        f_sessions = pool.submit(_fetch_sessions_safe)
+        f_alarm = pool.submit(_fetch_alarm_status)
+        for name, meta in local_sessions.items():
+            if not isinstance(meta, dict):
+                continue
+            ep = str(meta.get("endpoint") or "")
+            url = str(meta.get("url") or "")
+            tok = str(meta.get("token") or "")
+            if ep and url and tok and _token_looks_valid(meta.get("token_expires_at")):
+                http_futures[ep] = pool.submit(_fetch_single_vm_http_resources, ep, url, tok)
+        usage = f_usage.result()
+        server_sessions = f_sessions.result()
+        alarm_status = f_alarm.result()
+        http_resources_by_ep: dict[str, dict[str, Any] | None] = {
+            ep: fut.result() for ep, fut in http_futures.items()
+        }
 
     server_by_name = {s["name"]: s for s in server_sessions if s["name"] != "?"}
     leases = _get_leases(data_dir)
@@ -691,9 +920,54 @@ def tool_colab_dashboard(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]
             }
         )
 
+    missing_eps = [s["endpoint"] for s in session_list if s.get("endpoint") and not http_resources_by_ep.get(s["endpoint"])]
+    if missing_eps:
+        fallback_tokens = _fetch_proxy_tokens_fallback(data_dir)
+        fb_targets = [(ep, fallback_tokens[ep]) for ep in missing_eps if ep in fallback_tokens]
+        if fb_targets:
+            with ThreadPoolExecutor(max_workers=min(4, len(fb_targets))) as fb_pool:
+                fb_futs = {
+                    ep: fb_pool.submit(_fetch_single_vm_http_resources, ep, info.get("url", ""), info.get("token", ""))
+                    for ep, info in fb_targets
+                }
+                for ep, fut in fb_futs.items():
+                    res_fb = fut.result()
+                    if res_fb:
+                        http_resources_by_ep[ep] = res_fb
+
     jobs_raw = _read_json(data_dir / "detached_jobs.json", {})
     job_list = list(jobs_raw.values()) if isinstance(jobs_raw, dict) else []
     job_list.sort(key=lambda j: float(j.get("started_at", 0) or 0), reverse=True)
+    vm_telemetry = _read_json(data_dir / "vm_telemetry.json", {})
+    if not isinstance(vm_telemetry, dict):
+        vm_telemetry = {}
+
+    for s in session_list:
+        telem: dict[str, Any] = {}
+        ep = s.get("endpoint") or ""
+        if ep and isinstance(http_resources_by_ep.get(ep), dict):
+            telem.update(http_resources_by_ep[ep])  # type: ignore[arg-type]
+        cpu_rec = vm_telemetry.get(s["name"]) if isinstance(vm_telemetry.get(s["name"]), dict) else None
+        if cpu_rec and (now - float(cpu_rec.get("sampled_at") or 0)) <= 600.0:
+            for k in ("cpu_pct", "cpu_count", "load_1m", "sampled_at", "source"):
+                if cpu_rec.get(k) is not None:
+                    telem[k] = cpu_rec[k]
+        else:
+            for j in job_list:
+                if (
+                    isinstance(j, dict)
+                    and j.get("session") == s["name"]
+                    and j.get("state") == "running"
+                    and j.get("cpu_pct") is not None
+                ):
+                    telem["cpu_pct"] = j.get("cpu_pct")
+                    if j.get("cpu_count") is not None:
+                        telem["cpu_count"] = j.get("cpu_count")
+                    if j.get("load_1m") is not None:
+                        telem["load_1m"] = j.get("load_1m")
+                    break
+        s["telemetry"] = telem or None
+
     transfers_raw = _read_json(data_dir / "transfer_jobs.json", {})
     transfer_list = list(transfers_raw.values()) if isinstance(transfers_raw, dict) else []
     transfer_list.sort(key=lambda j: float(j.get("started_at", 0) or 0), reverse=True)
@@ -1188,6 +1462,38 @@ def gpu_stats():
         pass
     return None, None
 
+def _read_proc_stat():
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as f:
+            parts = [int(x) for x in f.readline().split()[1:]]
+        idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
+        return sum(parts), idle
+    except Exception:
+        return None, None
+
+_cpu_prev = [None, None]
+_t_a, _i_a = _read_proc_stat()
+if _t_a is not None:
+    time.sleep(0.15)
+    _t_b, _i_b = _read_proc_stat()
+    _cpu_prev = [_t_a, _i_a] if _t_b is None else [_t_a, _i_a]
+
+def cpu_stats():
+    t_now, i_now = _read_proc_stat()
+    cpu_pct = None
+    if t_now is not None and _cpu_prev[0] is not None and t_now > _cpu_prev[0]:
+        dt = t_now - _cpu_prev[0]
+        di = i_now - _cpu_prev[1]
+        cpu_pct = round(max(0.0, min(100.0, 100.0 * (1.0 - di / dt))), 1)
+        _cpu_prev[0], _cpu_prev[1] = t_now, i_now
+    elif t_now is not None:
+        _cpu_prev[0], _cpu_prev[1] = t_now, i_now
+    try:
+        load_1m = round(os.getloadavg()[0], 2)
+    except Exception:
+        load_1m = None
+    return cpu_pct, os.cpu_count(), load_1m
+
 synced_files = {}
 sync_state = {"last_drive_sync_ts": None, "synced_file_count": 0, "last_sync_attempt_ts": 0.0}
 rclone_conf_vm = os.environ.get("RCLONE_CONFIG", "/root/.config/rclone/rclone.conf")
@@ -1254,6 +1560,7 @@ done_ev = threading.Event()
 def hb():
     while not done_ev.is_set():
         gu, vr = gpu_stats()
+        cp, cc, l1 = cpu_stats()
         sync_checkpoints(final=False)
         write_st({
             "job_id": job_id,
@@ -1264,6 +1571,9 @@ def hb():
             "elapsed_sec": round(time.time() - t0, 1),
             "gpu_util": gu,
             "vram_used": vr,
+            "cpu_pct": cp,
+            "cpu_count": cc,
+            "load_1m": l1,
             "exit_code": None,
             "last_drive_sync_ts": sync_state["last_drive_sync_ts"],
             "synced_file_count": sync_state["synced_file_count"],
@@ -1280,6 +1590,7 @@ done_ev.set()
 th.join(timeout=2.0)
 sync_checkpoints(final=True)
 gu, vr = gpu_stats()
+cp, cc, l1 = cpu_stats()
 write_st({
     "job_id": job_id,
     "state": "completed" if rc == 0 else "failed",
@@ -1289,6 +1600,9 @@ write_st({
     "elapsed_sec": round(time.time() - t0, 1),
     "gpu_util": gu,
     "vram_used": vr,
+    "cpu_pct": cp,
+    "cpu_count": cc,
+    "load_1m": l1,
     "exit_code": rc,
     "last_drive_sync_ts": sync_state["last_drive_sync_ts"],
     "synced_file_count": sync_state["synced_file_count"],
@@ -1428,11 +1742,26 @@ def tool_colab_poll_job(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
                     "state": st_obj.get("state", "running"),
                     "gpu_util": st_obj.get("gpu_util"),
                     "vram_used": st_obj.get("vram_used"),
+                    "cpu_pct": st_obj.get("cpu_pct"),
+                    "cpu_count": st_obj.get("cpu_count"),
+                    "load_1m": st_obj.get("load_1m"),
                     "exit_code": st_obj.get("exit_code"),
                     "tail_line": st_obj.get("tail_line", ""),
                 }
             )
             _write_json(data_dir / "detached_jobs.json", jobs)
+        if st_obj.get("cpu_pct") is not None:
+            _record_vm_cpu_telemetry(
+                data_dir,
+                session,
+                {
+                    "cpu_pct": st_obj.get("cpu_pct"),
+                    "cpu_count": st_obj.get("cpu_count"),
+                    "load_1m": st_obj.get("load_1m"),
+                    "sampled_at": st_obj.get("heartbeat_ts") or time.time(),
+                    "source": "detached_job",
+                },
+            )
 
         return {"content": [{"type": "text", "text": json.dumps(st_obj, indent=2)}], "structuredContent": st_obj}
     finally:
@@ -1774,7 +2103,7 @@ def _handle_request(req: dict[str, Any], data_dir: Path) -> None:
                             "tools": {"listChanged": False},
                             "resources": {"subscribe": False, "listChanged": False},
                         },
-                        "serverInfo": {"name": "colab-pilot", "version": "1.2.0"},
+                        "serverInfo": {"name": "colab-pilot", "version": "1.3.0"},
                     },
                 }
             )

@@ -4,7 +4,7 @@ import {
   applyHostStyleVariables,
 } from '@modelcontextprotocol/ext-apps';
 
-const app = new App({ name: 'Colab Pilot', version: '1.2.0' }, {});
+const app = new App({ name: 'Colab Pilot', version: '1.3.0' }, {});
 let currentState = null;
 let busyAction = '';
 let receivedInitialResult = false;
@@ -132,6 +132,60 @@ function render(data) {
           const leaseBadge = s.lease_expires_in_min
             ? `<span class="pill pill-info">Warm ${Math.round(s.lease_expires_in_min)}m</span>`
             : `<span class="pill pill-muted">${s.untracked ? 'Untracked' : 'No Lease'}</span>`;
+          const t = s.telemetry || null;
+          const kBadge = t?.kernel_state
+            ? `<span class="pill ${t.kernel_state === 'busy' ? 'pill-warn' : 'pill-ok'}">Kernel ${esc(t.kernel_state)}</span>`
+            : '';
+          const barCls = (pct) => (pct >= 90 ? 'fill-err' : pct >= 75 ? 'fill-warn' : 'fill-info');
+          const resItems = [];
+          if (t && t.gpu_util_pct != null) {
+            const pct = Math.min(100, Math.max(0, Number(t.gpu_util_pct)));
+            resItems.push(`
+              <div class="res-item">
+                <div class="res-top"><span class="res-lbl">GPU</span><span>${pct.toFixed(0)}%</span></div>
+                <div class="meter-sm"><div class="${barCls(pct)}" style="width:${pct.toFixed(1)}%"></div></div>
+              </div>
+            `);
+          }
+          if (t && t.vram_total_gb > 0) {
+            const pct = Math.min(100, Math.max(0, Number(t.vram_pct ?? 0)));
+            resItems.push(`
+              <div class="res-item">
+                <div class="res-top"><span class="res-lbl">VRAM</span><span>${Number(t.vram_used_gb ?? 0).toFixed(1)} / ${Number(t.vram_total_gb).toFixed(0)} GiB</span></div>
+                <div class="meter-sm"><div class="${barCls(pct)}" style="width:${pct.toFixed(1)}%"></div></div>
+              </div>
+            `);
+          }
+          if (t && t.ram_total_gb > 0) {
+            const pct = Math.min(100, Math.max(0, Number(t.ram_pct ?? 0)));
+            resItems.push(`
+              <div class="res-item">
+                <div class="res-top"><span class="res-lbl">RAM</span><span>${Number(t.ram_used_gb ?? 0).toFixed(1)} / ${Number(t.ram_total_gb).toFixed(0)} GiB</span></div>
+                <div class="meter-sm"><div class="${barCls(pct)}" style="width:${pct.toFixed(1)}%"></div></div>
+              </div>
+            `);
+          }
+          if (t && t.cpu_pct != null) {
+            const pct = Math.min(100, Math.max(0, Number(t.cpu_pct)));
+            const cpuLbl = t.cpu_count ? `CPU (${t.cpu_count}c)` : 'CPU';
+            const loadTxt = t.load_1m != null ? ` · L${Number(t.load_1m).toFixed(2)}` : '';
+            resItems.push(`
+              <div class="res-item">
+                <div class="res-top"><span class="res-lbl">${esc(cpuLbl)}</span><span>${pct.toFixed(1)}%${esc(loadTxt)}</span></div>
+                <div class="meter-sm"><div class="${barCls(pct)}" style="width:${pct.toFixed(1)}%"></div></div>
+              </div>
+            `);
+          }
+          if (t && t.disk_total_gb > 0) {
+            const pct = Math.min(100, Math.max(0, Number(t.disk_pct ?? 0)));
+            resItems.push(`
+              <div class="res-item">
+                <div class="res-top"><span class="res-lbl">Disk</span><span>${Number(t.disk_used_gb ?? 0).toFixed(1)} / ${Number(t.disk_total_gb).toFixed(0)} GiB</span></div>
+                <div class="meter-sm"><div class="${barCls(pct)}" style="width:${pct.toFixed(1)}%"></div></div>
+              </div>
+            `);
+          }
+          const resGrid = resItems.length ? `<div class="res-grid">${resItems.join('')}</div>` : '';
           const hw = `${s.accelerator || 'CPU'} · ${s.machine_shape || 'STANDARD'}`;
           const openBtn =
             canOpenLinks && s.web_url
@@ -151,9 +205,11 @@ function render(data) {
                   <div class="card-sub">${esc(hw)} · ${esc(s.status || 'unknown')}</div>
                 </div>
                 <div class="badges">
+                  ${kBadge}
                   ${leaseBadge}
                 </div>
               </div>
+              ${resGrid}
               <div class="btn-row">
                 ${namedActions}
                 ${openBtn}
@@ -180,7 +236,7 @@ function render(data) {
               <div class="card-head">
                 <div>
                   <div class="card-title">${esc(j.job_id)} <span class="muted">on ${esc(j.session)}</span></div>
-                  <div class="card-sub">${esc(j.script_name || '')} · GPU ${esc(j.gpu_util ?? '—')} · VRAM ${esc(j.vram_used ?? '—')}</div>
+                  <div class="card-sub">${esc(j.script_name || '')} · GPU ${esc(j.gpu_util ?? '—')} · VRAM ${esc(j.vram_used ?? '—')} · CPU ${j.cpu_pct != null ? `${Number(j.cpu_pct).toFixed(1)}%` : '—'}</div>
                 </div>
                 <span class="pill ${pillCls}">${esc(st)}</span>
               </div>

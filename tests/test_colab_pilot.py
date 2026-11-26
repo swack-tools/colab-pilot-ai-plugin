@@ -429,6 +429,8 @@ with open({str(log_path)!r}, "a") as f:
     f.write(" ".join(args) + "\\n")
 if args and args[0] == "download":
     shutil.copyfile({str(status_src)!r}, args[-1])
+elif args and args[0] == "exec":
+    print('KA_CPU:{{"cpu_pct": 12.5, "cpu_count": 12, "load_1m": 0.42}}')
 """,
             encoding="utf-8",
         )
@@ -476,6 +478,9 @@ if args and args[0] == "download":
             self.assertIn("exec -s ka-vm", calls)
             self.assertTrue(stopped_ok, f"Expected auto_stop_vm to run stop; calls={calls!r}")
             self.assertTrue(exited_ok, "Expected keepalive daemon to self-terminate after leases & jobs cleared")
+            vm_telem = mcp._read_json(self.data_dir / "vm_telemetry.json", {})
+            self.assertEqual(vm_telem.get("ka-vm", {}).get("cpu_pct"), 12.5)
+            self.assertEqual(vm_telem.get("ka-vm", {}).get("cpu_count"), 12)
         finally:
             if pid > 0:
                 try:
@@ -549,10 +554,120 @@ with open({str(rclone_log)!r}, "a") as f:
         self.assertEqual(st["exit_code"], 0)
         self.assertIsNotNone(st["last_drive_sync_ts"])
         self.assertEqual(st["synced_file_count"], 1)
+        self.assertIn("cpu_count", st)
+        self.assertIn("cpu_pct", st)
         rc_calls = rclone_log.read_text(encoding="utf-8")
         self.assertIn("copy ", rc_calls)
         self.assertIn("--include *.pt", rc_calls)
         self.assertIn("copyto ", rc_calls)
+
+    def test_dashboard_http_resources_telemetry_zero_kernel_exec(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        mcp = _load_module("colab_mcp_server", SCRIPTS_DIR / "colab_mcp_server.py")
+        mcp._RESOURCES_MEM_CACHE.clear()
+        hits = {"resources": 0, "kernels": 0}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                return
+
+            def do_GET(self):
+                if self.path == "/api/colab/resources":
+                    hits["resources"] += 1
+                    payload = {
+                        "memory": {"totalBytes": 16 * 1024**3, "freeBytes": 12 * 1024**3},
+                        "disks": [{"filesystem": {"label": "kernel", "totalBytes": 100 * 1024**3, "usedBytes": 25 * 1024**3}}],
+                        "gpus": [{"name": "NVIDIA A100-SXM4-80GB", "memoryUsedBytes": 20 * 1024**3, "memoryTotalBytes": 80 * 1024**3, "gpuUtilization": 0.72, "memoryUtilization": 0.45, "everUsed": True}],
+                    }
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write((")]}'\n" + json.dumps(payload)).encode("utf-8"))
+                elif self.path == "/api/kernels":
+                    hits["kernels"] += 1
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps([{"id": "k1", "execution_state": "idle"}]).encode("utf-8"))
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        srv_th = threading.Thread(target=srv.serve_forever, daemon=True)
+        srv_th.start()
+
+        exec_log = self.tmp_path / "dash_colab_calls.log"
+        dash_colab = self.tmp_path / "dash_colab"
+        dash_colab.write_text(
+            f"""#!/usr/bin/env python3
+import sys
+args = sys.argv[1:]
+with open({str(exec_log)!r}, "a") as f:
+    f.write(" ".join(args) + "\\n")
+cmd = args[0] if args else ""
+if cmd == "usage":
+    print("Current balance: 5000.00 compute units\\nUsage rate: 10.99/hr\\nActive assignments: 2")
+elif cmd == "sessions":
+    print("[vm-live] ep-live | Hardware: A100 | Shape: High-RAM | Variant: GPU")
+    print("[vm-down] ep-down | Hardware: T4 | Shape: Standard | Variant: GPU")
+""",
+            encoding="utf-8",
+        )
+        dash_colab.chmod(0o755)
+
+        sess_file = self.home_dir / ".config" / "colab-cli" / "sessions.json"
+        sess_file.parent.mkdir(parents=True, exist_ok=True)
+        sess_file.write_text(
+            json.dumps(
+                {
+                    "vm-live": {"name": "vm-live", "endpoint": "ep-live", "url": f"http://127.0.0.1:{srv.server_address[1]}", "token": "tok-1", "accelerator": "A100", "machine_shape": "HIGH_RAM"},
+                    "vm-down": {"name": "vm-down", "endpoint": "ep-down", "url": "http://127.0.0.1:9", "token": "tok-2", "accelerator": "T4", "machine_shape": "STANDARD"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        mcp._write_json(self.data_dir / "vm_telemetry.json", {"vm-live": {"cpu_pct": 23.4, "cpu_count": 12, "load_1m": 1.15, "sampled_at": time.time(), "source": "keepalive"}})
+
+        old_env = {k: os.environ.get(k) for k in ("HOME", "COLAB_BIN")}
+        os.environ["HOME"] = str(self.home_dir)
+        os.environ["COLAB_BIN"] = str(dash_colab)
+        try:
+            t0 = time.monotonic()
+            dash1 = mcp.tool_colab_dashboard(self.data_dir, {})["structuredContent"]
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 3.0)
+            by_name = {s["name"]: s for s in dash1["sessions"]}
+            telem = by_name["vm-live"]["telemetry"]
+            self.assertIsNotNone(telem)
+            self.assertEqual(telem["ram_used_gb"], 4.0)
+            self.assertEqual(telem["ram_total_gb"], 16.0)
+            self.assertEqual(telem["vram_total_gb"], 80.0)
+            self.assertEqual(telem["gpu_util_pct"], 72.0)
+            self.assertEqual(telem["disk_used_gb"], 25.0)
+            self.assertEqual(telem["kernel_state"], "idle")
+            self.assertEqual(telem["cpu_pct"], 23.4)
+            self.assertIsNone(by_name["vm-down"]["telemetry"])
+            self.assertEqual(hits["resources"], 1)
+
+            # Second immediate call hits 8s memory cache
+            dash2 = mcp.tool_colab_dashboard(self.data_dir, {})["structuredContent"]
+            self.assertEqual(hits["resources"], 1)
+            self.assertEqual({s["name"]: s for s in dash2["sessions"]}["vm-live"]["telemetry"]["gpu_util_pct"], 72.0)
+
+            calls = exec_log.read_text(encoding="utf-8")
+            self.assertNotIn("exec", calls)
+            self.assertNotIn("ssh", calls)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 if __name__ == "__main__":

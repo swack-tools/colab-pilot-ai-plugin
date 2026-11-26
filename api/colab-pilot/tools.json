@@ -4,7 +4,7 @@
     {
       "name": "colab_dashboard",
       "title": "Open Colab Pilot dashboard",
-      "description": "Open the interactive Colab Pilot dashboard showing Compute Unit balance, burn rate, monthly budget guardrail, active sessions, detached jobs, and alarm controls."
+      "description": "Open the interactive Colab Pilot dashboard showing Compute Unit balance, burn rate, monthly budget guardrail, active sessions with live GPU, VRAM, system RAM, disk, and CPU telemetry, detached jobs, and alarm controls."
     },
     {
       "name": "colab_allocate_cascade",
