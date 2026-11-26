@@ -1,6 +1,12 @@
 # Colab Pilot
 
-Zero-waste Google Colab orchestration for Antigravity: GPU cascade provisioning, 0-CU Google Drive pre-staging, WebSocket-proof detached jobs, Compute Unit leak guardrails, parallel CPU sharding, and a live MCP App dashboard.
+Zero-waste Google Colab orchestration for Antigravity, Claude Code, and Codex: GPU cascade provisioning, 0-CU Google Drive pre-staging, WebSocket-proof detached jobs, Compute Unit leak guardrails, parallel CPU sharding, and a live MCP App dashboard.
+
+## Install
+
+```sh
+/plugin install colab-pilot --marketplace swack-tools/ai-plugin-marketplace
+```
 
 ## Components
 

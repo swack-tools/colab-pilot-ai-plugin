@@ -2103,7 +2103,7 @@ def _handle_request(req: dict[str, Any], data_dir: Path) -> None:
                             "tools": {"listChanged": False},
                             "resources": {"subscribe": False, "listChanged": False},
                         },
-                        "serverInfo": {"name": "colab-pilot", "version": "1.3.0"},
+                        "serverInfo": {"name": "colab-pilot", "version": "1.3.1"},
                     },
                 }
             )

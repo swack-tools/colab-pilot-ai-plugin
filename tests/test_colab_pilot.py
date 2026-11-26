@@ -669,6 +669,44 @@ elif cmd == "sessions":
                 else:
                     os.environ[k] = v
 
+    def test_mcp_json_and_hooks_work_for_both_claude_and_codex_roots(self) -> None:
+        mcp_cfg = json.loads((PLUGIN_DIR / ".mcp.json").read_text(encoding="utf-8"))
+        hooks_cfg = json.loads((PLUGIN_DIR / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        pilot = mcp_cfg["mcpServers"]["pilot"]
+        raw_cmd = pilot["args"][1]
+        self.assertNotIn("${CLAUDE_PLUGIN_ROOT:-${", raw_cmd)
+        self.assertNotIn("${CLAUDE_PLUGIN_ROOT:-${", json.dumps(hooks_cfg))
+
+        for mode in ("codex_subst", "claude_env"):
+            env = {k: v for k, v in self.env.items() if k not in ("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA", "PLUGIN_DATA")}
+            args = list(pilot["args"])
+            if mode == "codex_subst":
+                args = [
+                    a.replace("${PLUGIN_ROOT}", str(PLUGIN_DIR)).replace("${PLUGIN_DATA}", str(self.data_dir))
+                    for a in args
+                ]
+            else:
+                env["CLAUDE_PLUGIN_ROOT"] = str(PLUGIN_DIR)
+                env["CLAUDE_PLUGIN_DATA"] = str(self.data_dir)
+
+            reqs = [
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            ]
+            res = subprocess.run(
+                [pilot["command"], *args],
+                input="\n".join(json.dumps(r) for r in reqs) + "\n",
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=15,
+            )
+            self.assertEqual(res.returncode, 0, f"{mode}: {res.stderr}")
+            by_id = {m["id"]: m for m in (json.loads(ln) for ln in res.stdout.splitlines() if ln.strip())}
+            self.assertEqual(by_id[1]["result"]["serverInfo"]["version"], "1.3.1")
+            tool_names = [t["name"] for t in by_id[2]["result"]["tools"]]
+            self.assertIn("colab_dashboard", tool_names)
+
 
 if __name__ == "__main__":
     unittest.main()

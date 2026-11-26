@@ -4,7 +4,7 @@ import {
   applyHostStyleVariables,
 } from '@modelcontextprotocol/ext-apps';
 
-const app = new App({ name: 'Colab Pilot', version: '1.3.0' }, {});
+const app = new App({ name: 'Colab Pilot', version: '1.3.1' }, {});
 let currentState = null;
 let busyAction = '';
 let receivedInitialResult = false;
