@@ -1,6 +1,6 @@
 # Colab Pilot Guardrails
 
-- **Never invoke TTY-blocking `colab` commands**: Do not run `colab drivemount`, `colab auth`, `colab pay`, interactive `colab repl`, or bare `colab ssh` (which allocates a VM and waits on a TTY). Use `colab_mount_rclone` for headless Drive access and `colab ssh -s <name> -- '<cmd>' </dev/null` for one-shot shell commands.
+- **Never invoke TTY-blocking `colab` commands**: Do not run `colab drivemount`, `colab auth`, `colab pay`, interactive `colab repl`, or bare `colab ssh` (which allocates a VM and waits on a TTY). Prefer MCP tools `colab_mount_rclone`, `colab_exec`, `colab_smart_transfer`, `colab_launch_detached`, and `colab_poll_job` over raw `colab` CLI calls; if falling back to SSH, pass `colab ssh -s <name> -- '<cmd>' </dev/null`.
 - **Zero-waste Compute Unit (CU) discipline**: Never rent a GPU VM while running CPU-only extraction (`ffmpeg`) or slow multi-GB uploads. Validate archives and manifests locally first, and stage `>24 MiB` inputs to Google Drive at `0.00 CU` via `colab_smart_transfer` (`mode="drive_stage"`) before calling `colab_allocate_cascade`.
 - **Never rely on long-lived `colab exec` WebSockets**: Runs exceeding ~5 minutes risk `RuntimeError: Connection was lost` and `\r` `tqdm` line-buffering freezes. Launch via `colab_launch_detached` and monitor via `colab_poll_job` or `scripts/colab_watchdog.py`.
 - **Hardware & OOM safety**:

@@ -1,6 +1,6 @@
 <p class="eyebrow">API, hooks, and packaging</p>
 <h1>Technical<span> reference</span></h1>
-<p class="lead">Complete specification of the 10 <code>pilot</code> MCP tools, lifecycle hooks, interactive MCP App UI, state files, and deterministic release packaging.</p>
+<p class="lead">Complete specification of the 11 <code>pilot</code> MCP tools, lifecycle hooks, interactive MCP App UI, state files, and deterministic release packaging.</p>
 
 <nav class="toc" aria-label="On this page">
 <a href="#mcp-tools">MCP tools</a>
@@ -12,17 +12,18 @@
 
 <section id="mcp-tools">
 <h2><code>pilot</code> MCP server tools</h2>
-<p>The bundled local stdio server (<code>scripts/colab_pilot_mcp.py</code>) exposes 10 tools and the interactive dashboard resource:</p>
+<p>The bundled local stdio server (<code>scripts/colab_mcp_server.py</code>) exposes 11 tools and the interactive dashboard resource:</p>
 <div class="table-scroll">
 <table>
 <thead><tr><th>Tool</th><th>Purpose</th><th>Key behavior</th></tr></thead>
 <tbody>
 <tr><td><code>colab_dashboard</code></td><td>Live CU &amp; session telemetry</td><td>Reads <code>colab usage</code>, active sessions, detached jobs, keep-warm leases, and alarm state.</td></tr>
-<tr><td><code>colab_allocate_cascade</code></td><td>BF16 GPU cascade allocation</td><td>Tries tiers in priority order, probes GPU/VRAM/RAM/BF16, and recommends safe worker counts.</td></tr>
+<tr><td><code>colab_allocate_cascade</code></td><td>BF16 GPU cascade allocation</td><td>Tries tiers in priority order (supporting <code>prefer_gpus</code> and <code>high_mem</code>), probes GPU/VRAM/RAM/BF16, and recommends safe worker counts.</td></tr>
 <tr><td><code>colab_mount_rclone</code></td><td>Headless Google Drive mount</td><td>Copies local <code>rclone.conf</code> and mounts Drive read-only with streaming or random-seek tuning.</td></tr>
-<tr><td><code>colab_smart_transfer</code></td><td>Zero-waste archive transfer</td><td>Direct upload ≤24 MiB; Drive staging or verified 24 MiB chunked upload for larger files.</td></tr>
-<tr><td><code>colab_launch_detached</code></td><td>WebSocket-proof job launcher</td><td>Runs Python scripts under <code>nohup</code> with log normalization and 10-second GPU heartbeat JSON.</td></tr>
-<tr><td><code>colab_poll_job</code></td><td>REST job &amp; log poller</td><td>Fetches job status JSON and recent log lines over REST without holding a WebSocket open.</td></tr>
+<tr><td><code>colab_smart_transfer</code></td><td>Zero-waste archive transfer</td><td>Auto-mkdir direct upload ≤24 MiB, Drive staging, batch <code>files</code>, <code>remote_glob</code> downloads, and headless <code>drive_pull</code> extraction.</td></tr>
+<tr><td><code>colab_launch_detached</code></td><td>WebSocket-proof job launcher</td><td>Runs local or remote Python scripts under <code>nohup</code> with <code>cwd</code>, custom log mirroring, warm-chain cleanup, and 10-second GPU heartbeats.</td></tr>
+<tr><td><code>colab_poll_job</code></td><td>REST job &amp; log poller</td><td>Fetches job status JSON, background transfers, or ad-hoc logs, processes, and output directories without holding a WebSocket open.</td></tr>
+<tr><td><code>colab_exec</code></td><td>Bounded remote command</td><td>Executes bounded one-shot shell or Python commands (routing over SSH if kernel is busy) with optional safe PID/glob cleanup.</td></tr>
 <tr><td><code>colab_reset_vram</code></td><td>Zombie CUDA memory flush</td><td>Clears tracebacks, IPython <code>Out</code> caches, and PyTorch CUDA cache, reporting before/after VRAM.</td></tr>
 <tr><td><code>colab_keep_warm</code></td><td>Timed keep-warm lease</td><td>Registers or clears a timed lease so the <code>Stop</code> hook permits ending the turn intentionally.</td></tr>
 <tr><td><code>colab_stop_all</code></td><td>Verified VM teardown</td><td>Stops one named session or every active session, clears leases, and verifies <code>0.00/hr</code> burn.</td></tr>

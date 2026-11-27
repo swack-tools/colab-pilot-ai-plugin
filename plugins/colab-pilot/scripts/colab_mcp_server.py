@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Colab Pilot MCP Server (stdio JSON-RPC 2.0 + MCP Apps UI).
 
-Provides 10 tools for zero-waste Google Colab orchestration and serves the
+Provides 11 tools for zero-waste Google Colab orchestration and serves the
 interactive `ui://colab-pilot/dashboard.html` MCP App resource.
 """
 
@@ -29,7 +29,20 @@ from pathlib import Path
 from typing import Any
 
 APP_URI = "ui://colab-pilot/dashboard.html"
-VALID_TIERS = {"A100-highmem", "A100", "G4", "L4", "H100", "T4", "NONE"}
+VALID_TIERS = {
+    "H100-highmem",
+    "H100",
+    "A100-highmem",
+    "A100",
+    "G4-highmem",
+    "G4",
+    "L4-highmem",
+    "L4",
+    "T4-highmem",
+    "T4",
+    "NONE-highmem",
+    "NONE",
+}
 RESOURCES_TTL_SEC = 8.0
 _SEND_LOCK = threading.Lock()
 _STATE_FILE_LOCK = threading.Lock()
@@ -94,6 +107,76 @@ def _run_colab(args: list[str], timeout: float = 120) -> subprocess.CompletedPro
         text=True,
         timeout=timeout,
     )
+
+
+def _session_is_kernel_busy(session: str) -> bool:
+    if not session:
+        return False
+    local_sessions = _read_json(_sessions_file(), {})
+    if not isinstance(local_sessions, dict):
+        return False
+    meta = local_sessions.get(session)
+    if not isinstance(meta, dict):
+        return False
+    if meta.get("running"):
+        return True
+    url = str(meta.get("url") or "")
+    tok = str(meta.get("token") or "")
+    if url and tok and _token_looks_valid(meta.get("token_expires_at")):
+        try:
+            raw_k = _http_get_runtime_proxy(url, tok, "/api/kernels", timeout=1.5)
+            klist = json.loads(raw_k)
+            if isinstance(klist, list) and any(isinstance(k, dict) and k.get("execution_state") == "busy" for k in klist):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _run_remote_python(
+    session: str,
+    py_code: str,
+    env_map: dict[str, str] | None = None,
+    timeout: float = 60.0,
+    prefer_ssh: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Execute Python on a Colab VM via `colab ssh` (when busy/preferred) or `colab exec`."""
+    colab_bin = _resolve_colab_bin()
+    env_dict = {str(k): str(v) for k, v in (env_map or {}).items()}
+    use_ssh = prefer_ssh or _session_is_kernel_busy(session)
+    if use_ssh:
+        code_b64 = base64.b64encode(py_code.encode("utf-8")).decode("ascii")
+        env_b64 = base64.b64encode(json.dumps(env_dict).encode("utf-8")).decode("ascii")
+        remote_cmd = (
+            "python3 -B -u -c "
+            f"\"import base64,json,os; os.environ.update(json.loads(base64.b64decode('{env_b64}').decode())); "
+            f"exec(compile(base64.b64decode('{code_b64}').decode(), '<colab_pilot>', 'exec'))\""
+        )
+        res = _run_colab(["ssh", "-s", session, "--", remote_cmd], timeout=timeout)
+        if res.returncode == 0 or prefer_ssh:
+            return res, "ssh"
+        # Fall back to colab exec if ssh is unavailable on this runtime
+    env_flags: list[str] = []
+    for k, v in env_dict.items():
+        env_flags.extend(["--env", f"{k}={v}"])
+    res = subprocess.run(
+        [colab_bin, "exec", "-s", session, *env_flags],
+        input=py_code,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return res, "kernel"
+
+
+def _ensure_remote_dirs(session: str, dirs: list[str], timeout: float = 25.0) -> None:
+    targets = sorted({d.rstrip("/") for d in dirs if d and d.rstrip("/") not in {"", "/", "/content"}})
+    if not targets:
+        return
+    py = "import os\nfor d in " + repr(targets) + ":\n    os.makedirs(d, exist_ok=True)\n"
+    res, _ = _run_remote_python(session, py, timeout=timeout)
+    if res.returncode != 0:
+        raise RuntimeError(f"Failed to create remote directories {targets}: {(res.stderr or res.stdout).strip()[:200]}")
 
 
 def _parse_usage(data_dir: Path) -> dict[str, Any]:
@@ -651,13 +734,10 @@ def _run_keepalive_daemon(data_dir: Path, interval: float) -> int:
 def _run_transfer_worker(data_dir: Path, spec_path: Path) -> int:
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     transfer_id = str(spec["transfer_id"])
-    local_path = str(spec["local_path"])
-    drive_cache = str(spec["drive_cache"])
-    drive_target = str(spec["drive_target"])
+    kind = str(spec.get("kind") or "drive_stage")
     conf_path = Path(str(spec["conf_path"]))
     session = str(spec.get("session") or "")
     remote_path = str(spec.get("remote_path") or "")
-    size_bytes = int(spec.get("bytes", 0))
     log_file = Path(str(spec["log_file"]))
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -671,6 +751,94 @@ def _run_transfer_worker(data_dir: Path, spec_path: Path) -> int:
         _write_json(data_dir / "transfer_jobs.json", jobs)
 
     try:
+        if kind == "drive_pull":
+            drive_source = str(spec["drive_source"])
+            extract_archives = bool(spec.get("extract_archives", False))
+            extract_dir = str(spec.get("extract_dir") or remote_path)
+            conf_b64 = base64.b64encode(conf_path.read_bytes()).decode("ascii")
+            pull_py = (
+                "import base64, glob, json, os, shutil, subprocess\n"
+                "from pathlib import Path\n"
+                "rc = Path('/root/.config/rclone/rclone.conf')\n"
+                "rc.parent.mkdir(parents=True, exist_ok=True)\n"
+                "rc.write_bytes(base64.b64decode(os.environ['RCLONE_CONF_B64']))\n"
+                "os.chmod(rc, 0o600)\n"
+                "if not shutil.which('rclone'):\n"
+                "    subprocess.run(['bash', '-c', 'apt-get update -qq && apt-get install -y -qq rclone >/dev/null'], check=True)\n"
+                "src = os.environ['SRC_DRIVE']\n"
+                "dst = os.environ['DST_PATH']\n"
+                "ext = os.environ.get('EXTRACT_ARCHIVES') == '1'\n"
+                "ext_dir = os.environ.get('EXTRACT_DIR') or dst\n"
+                "src_leaf = src.rstrip('/').rsplit('/', 1)[-1]\n"
+                "dst_leaf = dst.rstrip('/').rsplit('/', 1)[-1]\n"
+                "is_single = (not dst.endswith('/')) and ('.' in src_leaf) and (src_leaf == dst_leaf or '.' in dst_leaf)\n"
+                "if is_single:\n"
+                "    os.makedirs(os.path.dirname(dst) or '/content', exist_ok=True)\n"
+                "    subprocess.run(['rclone', 'copyto', src, dst, '--config', str(rc), '--drive-chunk-size', '128M'], check=True)\n"
+                "    targets = [dst]\n"
+                "else:\n"
+                "    os.makedirs(dst, exist_ok=True)\n"
+                "    subprocess.run(['rclone', 'copy', src, dst, '--config', str(rc), '--transfers', '8', '--drive-chunk-size', '128M'], check=True)\n"
+                "    targets = []\n"
+                "    for r, _d, fs in os.walk(dst):\n"
+                "        for fn in fs:\n"
+                "            targets.append(os.path.join(r, fn))\n"
+                "extracted = []\n"
+                "if ext:\n"
+                "    os.makedirs(ext_dir, exist_ok=True)\n"
+                "    for tp in targets:\n"
+                "        low = tp.lower()\n"
+                "        if low.endswith(('.tar', '.tar.gz', '.tgz')):\n"
+                "            subprocess.run(['tar', '-xf', tp, '-C', ext_dir], check=True)\n"
+                "            extracted.append(tp)\n"
+                "print('DRIVE_PULL_JSON:' + json.dumps({'files': len(targets), 'extracted': extracted}))\n"
+            )
+            p_res, _ = _run_remote_python(
+                session,
+                pull_py,
+                env_map={
+                    "RCLONE_CONF_B64": conf_b64,
+                    "SRC_DRIVE": drive_source,
+                    "DST_PATH": remote_path,
+                    "EXTRACT_ARCHIVES": "1" if extract_archives else "0",
+                    "EXTRACT_DIR": extract_dir,
+                },
+                timeout=1800,
+            )
+            with open(log_file, "a", encoding="utf-8") as lf:
+                lf.write((p_res.stdout or "") + (p_res.stderr or ""))
+            if p_res.returncode != 0:
+                _update(
+                    {
+                        "state": "failed",
+                        "error": f"drive_pull failed: {(p_res.stderr or p_res.stdout).strip()[:240]}",
+                        "finished_at": time.time(),
+                    }
+                )
+                return 1
+            info: dict[str, Any] = {}
+            for ln in (p_res.stdout or "").splitlines():
+                if ln.startswith("DRIVE_PULL_JSON:"):
+                    info = json.loads(ln.split("DRIVE_PULL_JSON:", 1)[1])
+                    break
+            _update(
+                {
+                    "state": "completed",
+                    "phase": "done",
+                    "percent": 100.0,
+                    "pulled_to_vm": True,
+                    "remote_path": remote_path,
+                    "file_count": info.get("files"),
+                    "extracted": info.get("extracted", []),
+                    "finished_at": time.time(),
+                }
+            )
+            return 0
+
+        local_path = str(spec["local_path"])
+        drive_cache = str(spec["drive_cache"])
+        drive_target = str(spec["drive_target"])
+        size_bytes = int(spec.get("bytes", 0))
         cmd = [
             "rclone",
             "copy",
@@ -985,22 +1153,50 @@ def tool_colab_dashboard(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]
         "alarm": alarm_status,
         "active_operations": active_ops,
     }
-    summary = (
-        f"Colab Pilot — Balance: {usage['balance']:.2f} CU | "
-        f"Rate: {usage['rate_hourly']:.2f}/hr | "
-        f"Active assignments: {usage['active_assignments']} | "
-        f"Tracked sessions: {len(session_list)} | Tracked jobs: {len(job_list)}"
-    )
-    if active_ops:
-        summary += f" | In-flight ops: {len(active_ops)}"
+    summary_lines = [
+        (
+            f"Colab Pilot — Balance: {usage['balance']:.2f} CU | "
+            f"Rate: {usage['rate_hourly']:.2f}/hr | "
+            f"Active assignments: {usage['active_assignments']} | "
+            f"Tracked sessions: {len(session_list)} | Tracked jobs: {len(job_list)}"
+            + (f" | In-flight ops: {len(active_ops)}" if active_ops else "")
+        )
+    ]
+    for s in session_list:
+        parts = [f"{s['accelerator']} ({s['machine_shape']})", str(s["status"])]
+        t = s.get("telemetry")
+        if isinstance(t, dict):
+            if t.get("gpu_util_pct") is not None:
+                parts.append(f"GPU {t['gpu_util_pct']}%")
+            if t.get("vram_used_gb") is not None and t.get("vram_total_gb") is not None:
+                parts.append(f"VRAM {t['vram_used_gb']}/{t['vram_total_gb']} GB")
+            if t.get("ram_used_gb") is not None and t.get("ram_total_gb") is not None:
+                parts.append(f"RAM {t['ram_used_gb']}/{t['ram_total_gb']} GB")
+            if t.get("cpu_pct") is not None:
+                parts.append(f"CPU {t['cpu_pct']}%")
+        lease_m = s.get("lease_expires_in_min")
+        parts.append(f"lease {lease_m}m" if lease_m else "unleased")
+        summary_lines.append(f"  - [{s['display_name']}] " + " | ".join(parts))
+    for j in job_list[:5]:
+        if isinstance(j, dict) and j.get("state") in {"running", "failed"}:
+            summary_lines.append(
+                f"  - Job {j.get('job_id')} ({j.get('session')}): {j.get('state')}"
+                + (f" | GPU {j['gpu_util']}" if j.get("gpu_util") else "")
+                + (f" | VRAM {j['vram_used']}" if j.get("vram_used") else "")
+            )
+    for tr in transfer_list[:5]:
+        if isinstance(tr, dict) and tr.get("state") == "running":
+            summary_lines.append(
+                f"  - Transfer {tr.get('transfer_id')}: {tr.get('phase') or tr.get('state')} ({tr.get('percent')}%)"
+            )
     return {
-        "content": [{"type": "text", "text": summary}],
+        "content": [{"type": "text", "text": "\n".join(summary_lines)}],
         "structuredContent": structured,
     }
 
 
 MAX_CASCADE_BUDGET_SEC = 145.0
-DEFAULT_CASCADE_TIER_TIMEOUT_SEC = 28.0
+DEFAULT_CASCADE_TIER_TIMEOUT_SEC = 45.0
 DEFAULT_CASCADE_PROBE_TIMEOUT_SEC = 25.0
 
 
@@ -1014,21 +1210,39 @@ def _is_unsupported_accelerator_error(detail: str) -> bool:
     )
 
 
+def _normalize_cascade_tiers(raw_tiers: list[Any], high_mem: bool) -> list[str]:
+    out: list[str] = []
+    for item in raw_tiers:
+        t = str(item).strip()
+        if not t:
+            continue
+        if high_mem and not t.endswith("-highmem") and f"{t}-highmem" in VALID_TIERS:
+            t = f"{t}-highmem"
+        if t not in VALID_TIERS:
+            raise ValueError(f"Invalid tier {t!r}; valid: {sorted(VALID_TIERS)}")
+        if t not in out:
+            out.append(t)
+    return out
+
+
 def tool_colab_allocate_cascade(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
     session = str(args["session"])
-    tiers = args.get("tiers") or ["A100-highmem", "A100", "G4", "L4"]
+    high_mem = bool(args.get("high_mem", False))
+    raw_tiers = args.get("tiers") or args.get("prefer_gpus") or ["A100-highmem", "A100", "G4", "L4"]
+    tiers = _normalize_cascade_tiers(list(raw_tiers), high_mem)
     require_bf16 = bool(args.get("require_bf16", True))
     keep_warm_minutes = float(args.get("keep_warm_minutes", 0) or 0)
     max_wall = min(
         MAX_CASCADE_BUDGET_SEC,
         max(5.0, float(args.get("max_wall_seconds", 140.0) or 140.0)),
     )
-    per_tier_cap = float(os.environ.get("COLAB_CASCADE_TIER_TIMEOUT_SEC", str(DEFAULT_CASCADE_TIER_TIMEOUT_SEC)))
+    if args.get("per_tier_timeout_seconds") is not None:
+        per_tier_cap = max(2.0, min(max_wall, float(args["per_tier_timeout_seconds"])))
+    elif os.environ.get("COLAB_CASCADE_TIER_TIMEOUT_SEC"):
+        per_tier_cap = float(os.environ["COLAB_CASCADE_TIER_TIMEOUT_SEC"])
+    else:
+        per_tier_cap = min(55.0, max(32.0, (max_wall - 18.0) / max(1, len(tiers))))
     probe_cap = float(os.environ.get("COLAB_CASCADE_PROBE_TIMEOUT_SEC", str(DEFAULT_CASCADE_PROBE_TIMEOUT_SEC)))
-
-    for t in tiers:
-        if t not in VALID_TIERS:
-            raise ValueError(f"Invalid tier {t!r}; valid: {sorted(VALID_TIERS)}")
 
     start_t = time.monotonic()
     deadline = start_t + max_wall
@@ -1055,11 +1269,13 @@ def tool_colab_allocate_cascade(data_dir: Path, args: dict[str, Any]) -> dict[st
             attempts.append({"tier": tier, "ok": False, "skipped": True, "detail": "Cascade wall-clock budget exhausted"})
             break
 
+        base_gpu = tier[:-8] if tier.endswith("-highmem") else tier
+        is_hm = tier.endswith("-highmem") or high_mem
         cmd = ["new", "-s", session]
-        if tier == "A100-highmem":
-            cmd.extend(["--gpu", "A100", "--high-mem"])
-        elif tier != "NONE":
-            cmd.extend(["--gpu", tier])
+        if base_gpu != "NONE":
+            cmd.extend(["--gpu", base_gpu])
+        if is_hm:
+            cmd.append("--high-mem")
 
         step_timeout = max(1.0, min(per_tier_cap, rem))
         try:
@@ -1232,14 +1448,182 @@ def _sha256_file(path: Path) -> str:
 
 def tool_colab_smart_transfer(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
     direction = str(args["direction"])
-    local_path = Path(str(args["local_path"])).expanduser()
-    remote_path = str(args["remote_path"])
     session = str(args.get("session") or "")
     mode = str(args.get("mode", "auto"))
     drive_cache = str(args.get("drive_cache_path", "gdrive_root:Colab Notebooks/colab_pilot_cache"))
     conf_path = _find_rclone_conf()
 
+    # Batch multi-file upload or download
+    files_arg = args.get("files")
+    if isinstance(files_arg, list) and files_arg:
+        if not session:
+            raise ValueError("`session` is required for batch `files` transfer")
+        if direction == "upload":
+            items: list[tuple[Path, str, int]] = []
+            for entry in files_arg:
+                lp = Path(str(entry["local_path"])).expanduser()
+                rp = str(entry["remote_path"])
+                if not lp.is_file():
+                    raise FileNotFoundError(f"Local file not found: {lp}")
+                items.append((lp, rp, lp.stat().st_size))
+            _ensure_remote_dirs(session, [os.path.dirname(rp) for _lp, rp, _sz in items])
+            results: list[dict[str, Any]] = []
+            small_items = [(lp, rp, sz) for lp, rp, sz in items if sz <= 24 * 1024 * 1024]
+            large_items = [(lp, rp, sz) for lp, rp, sz in items if sz > 24 * 1024 * 1024]
+
+            def _up_small(item: tuple[Path, str, int]) -> dict[str, Any]:
+                lp, rp, sz = item
+                res = _run_colab(["upload", "-s", session, str(lp), rp], timeout=120)
+                if res.returncode != 0:
+                    raise RuntimeError(f"Upload failed for {lp}: {(res.stderr or res.stdout).strip()[:200]}")
+                return {"local_path": str(lp), "remote_path": rp, "bytes": sz, "mode": "direct"}
+
+            if small_items:
+                with ThreadPoolExecutor(max_workers=min(3, len(small_items))) as pool:
+                    results.extend(list(pool.map(_up_small, small_items)))
+            for lp, rp, sz in large_items:
+                sub = tool_colab_smart_transfer(
+                    data_dir,
+                    {
+                        "session": session,
+                        "direction": "upload",
+                        "local_path": str(lp),
+                        "remote_path": rp,
+                        "mode": mode,
+                        "drive_cache_path": drive_cache,
+                        "async_transfer": bool(args.get("async_transfer", False)),
+                    },
+                )["structuredContent"]
+                results.append(sub)
+            out = {
+                "mode": "batch",
+                "direction": "upload",
+                "session": session,
+                "count": len(results),
+                "bytes": sum(sz for _lp, _rp, sz in items),
+                "files": results,
+            }
+            return {"content": [{"type": "text", "text": json.dumps(out, indent=2)}], "structuredContent": out}
+
+        if direction == "download":
+            dl_results: list[dict[str, Any]] = []
+            total_bytes = 0
+            for entry in files_arg:
+                lp = Path(str(entry["local_path"])).expanduser()
+                rp = str(entry["remote_path"])
+                lp.parent.mkdir(parents=True, exist_ok=True)
+                res = _run_colab(["download", "-s", session, rp, str(lp)], timeout=300)
+                if res.returncode != 0 or not lp.is_file():
+                    raise RuntimeError(f"Download failed for {rp}: {(res.stderr or res.stdout).strip()[:200]}")
+                sz = lp.stat().st_size
+                total_bytes += sz
+                dl_results.append({"local_path": str(lp), "remote_path": rp, "bytes": sz, "sha256": _sha256_file(lp)})
+            out = {
+                "mode": "batch",
+                "direction": "download",
+                "session": session,
+                "count": len(dl_results),
+                "bytes": total_bytes,
+                "files": dl_results,
+            }
+            return {"content": [{"type": "text", "text": json.dumps(out, indent=2)}], "structuredContent": out}
+        raise ValueError(f"Batch `files` is not supported for direction={direction!r}")
+
+    # Direct headless Google Drive -> Colab VM pull (bypasses stale FUSE mounts)
+    if direction == "drive_to_vm" or mode == "drive_pull":
+        if not session:
+            raise ValueError("`session` is required for drive_to_vm / drive_pull")
+        if not conf_path:
+            raise FileNotFoundError("No rclone.conf found for drive_pull")
+        drive_source = str(args.get("drive_source") or drive_cache).strip()
+        remote_path = str(args.get("remote_path") or "/content/work").strip()
+        extract_archives = bool(args.get("extract_archives", False))
+        extract_dir = str(args.get("extract_dir") or remote_path).strip()
+        transfer_id = str(args.get("transfer_id") or f"pull-{uuid.uuid4().hex[:8]}")
+        async_requested = bool(args.get("async_transfer", False))
+        sync_wait_cap = float(os.environ.get("COLAB_SYNC_TRANSFER_WAIT_SEC", "115") or 115)
+
+        transfers_dir = data_dir / "transfers"
+        transfers_dir.mkdir(parents=True, exist_ok=True)
+        log_file = transfers_dir / f"{transfer_id}.log"
+        spec_file = transfers_dir / f"{transfer_id}.spec.json"
+        spec_file.write_text(
+            json.dumps(
+                {
+                    "transfer_id": transfer_id,
+                    "kind": "drive_pull",
+                    "drive_source": drive_source,
+                    "conf_path": str(conf_path),
+                    "session": session,
+                    "remote_path": remote_path,
+                    "extract_archives": extract_archives,
+                    "extract_dir": extract_dir,
+                    "log_file": str(log_file),
+                }
+            ),
+            encoding="utf-8",
+        )
+        jobs = _read_json(data_dir / "transfer_jobs.json", {})
+        if not isinstance(jobs, dict):
+            jobs = {}
+        init_rec = {
+            "transfer_id": transfer_id,
+            "job_id": transfer_id,
+            "mode": "drive_pull",
+            "direction": "drive_to_vm",
+            "session": session,
+            "drive_source": drive_source,
+            "remote_path": remote_path,
+            "state": "running",
+            "phase": "vm_pull",
+            "percent": 0.0,
+            "log_file": str(log_file),
+            "started_at": time.time(),
+        }
+        jobs[transfer_id] = init_rec
+        _write_json(data_dir / "transfer_jobs.json", jobs)
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                os.path.abspath(__file__),
+                "--data-dir",
+                str(data_dir),
+                "--transfer-worker",
+                str(spec_file),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        if async_requested:
+            out = dict(init_rec)
+            out["async"] = True
+            return {"content": [{"type": "text", "text": json.dumps(out, indent=2)}], "structuredContent": out}
+        wait_deadline = time.monotonic() + max(1.0, sync_wait_cap)
+        while time.monotonic() < wait_deadline:
+            cur_jobs = _read_json(data_dir / "transfer_jobs.json", {})
+            cur = cur_jobs.get(transfer_id) if isinstance(cur_jobs, dict) else None
+            if isinstance(cur, dict):
+                if cur.get("state") == "completed":
+                    out = dict(cur)
+                    out["async"] = False
+                    return {"content": [{"type": "text", "text": json.dumps(out, indent=2)}], "structuredContent": out}
+                if cur.get("state") == "failed":
+                    raise RuntimeError(str(cur.get("error") or "drive_pull transfer failed"))
+            time.sleep(0.25)
+        cur_jobs = _read_json(data_dir / "transfer_jobs.json", {})
+        cur = cur_jobs.get(transfer_id) if isinstance(cur_jobs, dict) else init_rec
+        out = dict(cur if isinstance(cur, dict) else init_rec)
+        out["async"] = True
+        return {"content": [{"type": "text", "text": json.dumps(out, indent=2)}], "structuredContent": out}
+
     if direction == "upload":
+        if not args.get("local_path") or not args.get("remote_path"):
+            raise ValueError("`local_path` and `remote_path` are required for upload")
+        local_path = Path(str(args["local_path"])).expanduser()
+        remote_path = str(args["remote_path"])
         if not local_path.is_file():
             raise FileNotFoundError(f"Local file not found: {local_path}")
         size_bytes = local_path.stat().st_size
@@ -1257,6 +1641,7 @@ def tool_colab_smart_transfer(data_dir: Path, args: dict[str, Any]) -> dict[str,
         if chosen == "direct":
             if not session:
                 raise ValueError("`session` is required for direct upload")
+            _ensure_remote_dirs(session, [os.path.dirname(remote_path)])
             res = _run_colab(["upload", "-s", session, str(local_path), remote_path], timeout=300)
             if res.returncode != 0:
                 raise RuntimeError(res.stderr or res.stdout)
@@ -1416,9 +1801,43 @@ def tool_colab_smart_transfer(data_dir: Path, args: dict[str, Any]) -> dict[str,
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Download
+    # Download (single file or remote_glob into local directory)
     if not session:
         raise ValueError("`session` is required for download")
+    remote_glob = str(args.get("remote_glob") or "").strip()
+    if remote_glob:
+        if not args.get("local_path"):
+            raise ValueError("`local_path` (destination directory) is required for remote_glob download")
+        local_dir = Path(str(args["local_path"])).expanduser()
+        local_dir.mkdir(parents=True, exist_ok=True)
+        g_py = f"import glob, json, os\nprint('GLOB_JSON:' + json.dumps(sorted(p for p in glob.glob({remote_glob!r}) if os.path.isfile(p))))\n"
+        g_res, _ = _run_remote_python(session, g_py, timeout=30)
+        if g_res.returncode != 0:
+            raise RuntimeError(f"remote_glob failed: {(g_res.stderr or g_res.stdout).strip()[:200]}")
+        matched: list[str] = []
+        for ln in (g_res.stdout or "").splitlines():
+            if ln.startswith("GLOB_JSON:"):
+                matched = json.loads(ln.split("GLOB_JSON:", 1)[1])
+                break
+        if not matched:
+            raise FileNotFoundError(f"No remote files matched {remote_glob!r} on {session}")
+        dl_files: list[dict[str, Any]] = []
+        total_b = 0
+        for rp in matched:
+            dst = local_dir / Path(rp).name
+            r_dl = _run_colab(["download", "-s", session, rp, str(dst)], timeout=300)
+            if r_dl.returncode != 0 or not dst.is_file():
+                raise RuntimeError(f"Download failed for {rp}: {(r_dl.stderr or r_dl.stdout).strip()[:200]}")
+            sz = dst.stat().st_size
+            total_b += sz
+            dl_files.append({"local_path": str(dst), "remote_path": rp, "bytes": sz, "sha256": _sha256_file(dst)})
+        out = {"mode": "glob", "direction": "download", "session": session, "count": len(dl_files), "bytes": total_b, "files": dl_files}
+        return {"content": [{"type": "text", "text": json.dumps(out, indent=2)}], "structuredContent": out}
+
+    if not args.get("local_path") or not args.get("remote_path"):
+        raise ValueError("`local_path` and `remote_path` are required for download")
+    local_path = Path(str(args["local_path"])).expanduser()
+    remote_path = str(args["remote_path"])
     local_path.parent.mkdir(parents=True, exist_ok=True)
     res = _run_colab(["download", "-s", session, remote_path, str(local_path)], timeout=600)
     if res.returncode != 0 or not local_path.is_file():
@@ -1440,8 +1859,12 @@ job_dir, script, s_args, job_id = sys.argv[1], sys.argv[2], json.loads(sys.argv[
 sync_dir = sys.argv[5] if len(sys.argv) > 5 else ""
 drive_sync_dest = sys.argv[6] if len(sys.argv) > 6 else ""
 sync_include = json.loads(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else []
+work_cwd = sys.argv[8] if len(sys.argv) > 8 else ""
+custom_log_p = sys.argv[9] if len(sys.argv) > 9 else ""
 status_p = f"{job_dir}/status.json"
 log_p = f"{job_dir}/job.log"
+if custom_log_p:
+    os.makedirs(os.path.dirname(custom_log_p) or ".", exist_ok=True)
 
 def write_st(st):
     tmp = status_p + ".tmp"
@@ -1548,8 +1971,14 @@ def sync_checkpoints(final=False):
         pass
 
 t0 = time.time()
+proc_env = os.environ.copy()
+if work_cwd:
+    cur_pp = proc_env.get("PYTHONPATH", "")
+    proc_env["PYTHONPATH"] = f"{work_cwd}:{cur_pp}" if cur_pp else work_cwd
 proc = subprocess.Popen(
     [sys.executable, "-u", script, *s_args],
+    cwd=work_cwd or None,
+    env=proc_env,
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
     text=True,
@@ -1566,6 +1995,8 @@ def hb():
             "job_id": job_id,
             "state": "running",
             "pid": proc.pid,
+            "cwd": work_cwd or None,
+            "log_path": custom_log_p or log_p,
             "started_at": t0,
             "heartbeat_ts": time.time(),
             "elapsed_sec": round(time.time() - t0, 1),
@@ -1582,9 +2013,17 @@ def hb():
 
 th = threading.Thread(target=hb, daemon=True)
 th.start()
-with open(log_p, "w", encoding="utf-8", buffering=1) as lf:
-    for ch in iter(lambda: proc.stdout.read(256), ""):
-        lf.write(ch.replace("\\r", "\\n"))
+extra_lf = open(custom_log_p, "w", encoding="utf-8", buffering=1) if custom_log_p else None
+try:
+    with open(log_p, "w", encoding="utf-8", buffering=1) as lf:
+        for ch in iter(lambda: proc.stdout.read(256), ""):
+            norm = ch.replace("\\r", "\\n")
+            lf.write(norm)
+            if extra_lf is not None:
+                extra_lf.write(norm)
+finally:
+    if extra_lf is not None:
+        extra_lf.close()
 rc = proc.wait()
 done_ev.set()
 th.join(timeout=2.0)
@@ -1595,6 +2034,8 @@ write_st({
     "job_id": job_id,
     "state": "completed" if rc == 0 else "failed",
     "pid": proc.pid,
+    "cwd": work_cwd or None,
+    "log_path": custom_log_p or log_p,
     "started_at": t0,
     "heartbeat_ts": time.time(),
     "elapsed_sec": round(time.time() - t0, 1),
@@ -1612,9 +2053,9 @@ write_st({
 
 def tool_colab_launch_detached(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
     session = str(args["session"])
-    script_path = Path(str(args["script_path"])).expanduser()
-    if not script_path.is_file():
-        raise FileNotFoundError(f"Script not found: {script_path}")
+    raw_script = str(args.get("remote_script_path") or args.get("script_path") or "").strip()
+    if not raw_script:
+        raise ValueError("`script_path` (or `remote_script_path`) is required")
 
     job_id = str(args.get("job_id") or f"job-{uuid.uuid4().hex[:8]}")
     script_args = [str(x) for x in (args.get("args") or [])]
@@ -1623,34 +2064,100 @@ def tool_colab_launch_detached(data_dir: Path, args: dict[str, Any]) -> dict[str
     sync_dir = str(args.get("sync_dir") or "").strip()
     drive_sync_dest = str(args.get("drive_sync_dest") or "").strip()
     sync_include = [str(x) for x in (args.get("sync_include") or [])]
+    cwd = str(args.get("cwd") or "").strip()
+    custom_log_path = str(args.get("log_path") or "").strip()
+    kill_existing_pattern = str(args.get("kill_existing_pattern") or "").strip()
+    kill_pids = [int(p) for p in (args.get("kill_pids") or [])]
+    clean_globs = [str(g) for g in (args.get("clean_globs") or [])]
 
     remote_dir = f"/content/.colab_jobs/{job_id}"
-    remote_script = f"{remote_dir}/{script_path.name}"
-    res_up = _run_colab(["upload", "-s", session, str(script_path), remote_script], timeout=120)
-    if res_up.returncode != 0:
-        raise RuntimeError(f"Failed to upload script: {res_up.stderr or res_up.stdout}")
+    local_candidate = Path(raw_script).expanduser()
+    is_remote_script = bool(args.get("remote_script_path")) or (
+        not local_candidate.is_file() and raw_script.startswith("/content/")
+    )
+
+    script_b64 = ""
+    if is_remote_script:
+        remote_script = raw_script
+        script_name = Path(raw_script).name
+    else:
+        if not local_candidate.is_file():
+            raise FileNotFoundError(f"Script not found: {local_candidate}")
+        script_name = local_candidate.name
+        remote_script = f"{remote_dir}/{script_name}"
+        if local_candidate.stat().st_size <= 512 * 1024:
+            script_b64 = base64.b64encode(local_candidate.read_bytes()).decode("ascii")
+        else:
+            _ensure_remote_dirs(session, [remote_dir])
+            res_up = _run_colab(["upload", "-s", session, str(local_candidate), remote_script], timeout=120)
+            if res_up.returncode != 0:
+                raise RuntimeError(f"Failed to upload script: {res_up.stderr or res_up.stdout}")
 
     wrapper_src = build_detached_wrapper_source()
-    env_flags: list[str] = []
+    env_map: dict[str, str] = {}
     if sync_dir and drive_sync_dest:
         conf_path = _find_rclone_conf()
         if conf_path:
-            conf_b64 = base64.b64encode(conf_path.read_bytes()).decode("ascii")
-            env_flags.extend(["--env", f"RCLONE_CONF_B64={conf_b64}"])
+            env_map["RCLONE_CONF_B64"] = base64.b64encode(conf_path.read_bytes()).decode("ascii")
 
     runner_code = (
-        "import base64, json, os, shutil, subprocess, sys\n"
+        "import base64, glob, json, os, shutil, signal, subprocess, sys, time\n"
         "from pathlib import Path\n"
         f"job_dir = {remote_dir!r}\n"
         f"script = {remote_script!r}\n"
+        f"script_b64 = {script_b64!r}\n"
+        f"is_remote = {is_remote_script!r}\n"
         f"s_args = {script_args!r}\n"
         f"extra_env = {extra_env!r}\n"
         f"job_id = {job_id!r}\n"
         f"sync_dir = {sync_dir!r}\n"
         f"drive_sync_dest = {drive_sync_dest!r}\n"
         f"sync_include = {sync_include!r}\n"
+        f"work_cwd = {cwd!r}\n"
+        f"custom_log_path = {custom_log_path!r}\n"
+        f"kill_pattern = {kill_existing_pattern!r}\n"
+        f"kill_pids = {kill_pids!r}\n"
+        f"clean_globs = {clean_globs!r}\n"
         f"wrapper_src = {wrapper_src!r}\n"
         "os.makedirs(job_dir, exist_ok=True)\n"
+        "if script_b64:\n"
+        "    with open(script, 'wb') as sf:\n"
+        "        sf.write(base64.b64decode(script_b64))\n"
+        "elif is_remote and not os.path.isfile(script):\n"
+        "    sys.stderr.write(f'Remote script not found: {script}\\n')\n"
+        "    sys.exit(2)\n"
+        "killed = []\n"
+        "self_pids = {os.getpid(), os.getppid()}\n"
+        "for pid in kill_pids:\n"
+        "    if pid not in self_pids:\n"
+        "        try:\n"
+        "            os.kill(pid, signal.SIGKILL)\n"
+        "            killed.append(pid)\n"
+        "        except ProcessLookupError:\n"
+        "            pass\n"
+        "if kill_pattern:\n"
+        "    for entry in os.listdir('/proc'):\n"
+        "        if not entry.isdigit(): continue\n"
+        "        pid = int(entry)\n"
+        "        if pid in self_pids or pid <= 1: continue\n"
+        "        try:\n"
+        "            cmd_raw = open(f'/proc/{pid}/cmdline', 'rb').read().replace(b'\\x00', b' ').decode('utf-8', 'replace')\n"
+        "        except Exception:\n"
+        "            continue\n"
+        "        if kill_pattern in cmd_raw and 'colab_pilot' not in cmd_raw and 'jupyter' not in cmd_raw:\n"
+        "            try:\n"
+        "                os.kill(pid, signal.SIGKILL)\n"
+        "                killed.append(pid)\n"
+        "            except ProcessLookupError:\n"
+        "                pass\n"
+        "if killed:\n"
+        "    time.sleep(0.5)\n"
+        "for g in clean_globs:\n"
+        "    for fp in glob.glob(g):\n"
+        "        try:\n"
+        "            if os.path.isfile(fp) or os.path.islink(fp): os.unlink(fp)\n"
+        "        except OSError:\n"
+        "            pass\n"
         "if os.environ.get('RCLONE_CONF_B64'):\n"
         "    rc = Path('/root/.config/rclone/rclone.conf')\n"
         "    rc.parent.mkdir(parents=True, exist_ok=True)\n"
@@ -1664,13 +2171,28 @@ def tool_colab_launch_detached(data_dir: Path, args: dict[str, Any]) -> dict[str
         "env['PYTHONUNBUFFERED'] = '1'\n"
         "env['TQDM_MININTERVAL'] = '5'\n"
         "env.update(extra_env)\n"
-        "cmd = ['nohup', sys.executable, '-u', wrapper, job_dir, script, json.dumps(s_args), job_id, sync_dir, drive_sync_dest, json.dumps(sync_include)]\n"
+        "cmd = ['nohup', sys.executable, '-u', wrapper, job_dir, script, json.dumps(s_args), job_id, sync_dir, drive_sync_dest, json.dumps(sync_include), work_cwd, custom_log_path]\n"
         "p = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=open(f'{job_dir}/nohup.out', 'w'), stderr=subprocess.STDOUT, start_new_session=True)\n"
         "print('DETACHED_PID:' + str(p.pid))\n"
+        "if killed: print('KILLED_PIDS:' + json.dumps(killed))\n"
     )
-    res_ex = subprocess.run([_resolve_colab_bin(), "exec", "-s", session, *env_flags], input=runner_code, capture_output=True, text=True, timeout=60)
+    res_ex, runner_used = _run_remote_python(session, runner_code, env_map=env_map, timeout=60)
     if res_ex.returncode != 0:
         raise RuntimeError(f"Detached launch failed: {res_ex.stderr or res_ex.stdout}")
+
+    detached_pid = None
+    killed_out: list[int] = []
+    for ln in (res_ex.stdout or "").splitlines():
+        if ln.startswith("DETACHED_PID:"):
+            try:
+                detached_pid = int(ln.split("DETACHED_PID:", 1)[1].strip())
+            except ValueError:
+                pass
+        elif ln.startswith("KILLED_PIDS:"):
+            try:
+                killed_out = json.loads(ln.split("KILLED_PIDS:", 1)[1])
+            except Exception:
+                pass
 
     jobs = _read_json(data_dir / "detached_jobs.json", {})
     if not isinstance(jobs, dict):
@@ -1678,8 +2200,14 @@ def tool_colab_launch_detached(data_dir: Path, args: dict[str, Any]) -> dict[str
     job_rec = {
         "job_id": job_id,
         "session": session,
-        "script_name": script_path.name,
+        "script_name": script_name,
+        "remote_script": remote_script,
         "remote_dir": remote_dir,
+        "cwd": cwd or None,
+        "log_path": custom_log_path or f"{remote_dir}/job.log",
+        "pid": detached_pid,
+        "killed_pids": killed_out,
+        "runner_used": runner_used,
         "state": "running",
         "auto_stop_vm": auto_stop_vm,
         "sync_dir": sync_dir or None,
@@ -1693,20 +2221,132 @@ def tool_colab_launch_detached(data_dir: Path, args: dict[str, Any]) -> dict[str
     return {"content": [{"type": "text", "text": json.dumps(job_rec, indent=2)}], "structuredContent": job_rec}
 
 
-def tool_colab_poll_job(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
-    job_id = str(args["job_id"])
-    session = str(args.get("session") or "")
-    tail_lines = int(args.get("tail_lines", 30) or 30)
+def _fetch_session_telemetry(session: str) -> dict[str, Any] | None:
+    local_sessions = _read_json(_sessions_file(), {})
+    if not isinstance(local_sessions, dict):
+        return None
+    meta = local_sessions.get(session)
+    if not isinstance(meta, dict):
+        return None
+    ep = str(meta.get("endpoint") or "")
+    url = str(meta.get("url") or "")
+    tok = str(meta.get("token") or "")
+    if ep and url and tok and _token_looks_valid(meta.get("token_expires_at")):
+        return _fetch_single_vm_http_resources(ep, url, tok)
+    return None
 
-    transfers = _read_json(data_dir / "transfer_jobs.json", {})
-    if isinstance(transfers, dict) and job_id in transfers and isinstance(transfers[job_id], dict):
-        rec = dict(transfers[job_id])
-        lp = Path(str(rec.get("log_file") or ""))
-        if lp.is_file() and tail_lines > 0:
-            rec["tail_lines"] = lp.read_text(encoding="utf-8", errors="replace").splitlines()[-tail_lines:]
-        else:
-            rec["tail_lines"] = []
-        return {"content": [{"type": "text", "text": json.dumps(rec, indent=2)}], "structuredContent": rec}
+
+def tool_colab_poll_job(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
+    job_id = str(args.get("job_id") or "").strip()
+    session = str(args.get("session") or "").strip()
+    tail_lines = int(args.get("tail_lines", 30) or 30)
+    log_path = str(args.get("log_path") or "").strip()
+    pid_arg = args.get("pid")
+    process_pattern = str(args.get("process_pattern") or "").strip()
+    artifacts_dir = str(args.get("artifacts_dir") or "").strip()
+
+    if job_id:
+        transfers = _read_json(data_dir / "transfer_jobs.json", {})
+        if isinstance(transfers, dict) and job_id in transfers and isinstance(transfers[job_id], dict):
+            rec = dict(transfers[job_id])
+            lp = Path(str(rec.get("log_file") or ""))
+            if lp.is_file() and tail_lines > 0:
+                rec["tail_lines"] = lp.read_text(encoding="utf-8", errors="replace").splitlines()[-tail_lines:]
+            else:
+                rec["tail_lines"] = []
+            return {"content": [{"type": "text", "text": json.dumps(rec, indent=2)}], "structuredContent": rec}
+
+    # Auto-resolve latest detached job if neither job_id nor ad-hoc inspection args were passed
+    if not job_id and session and not (log_path or pid_arg is not None or process_pattern or artifacts_dir):
+        jobs = _read_json(data_dir / "detached_jobs.json", {})
+        if isinstance(jobs, dict):
+            cand = [j for j in jobs.values() if isinstance(j, dict) and j.get("session") == session]
+            cand.sort(key=lambda j: float(j.get("started_at", 0) or 0), reverse=True)
+            if cand:
+                job_id = str(cand[0].get("job_id") or "")
+
+    # Ad-hoc log / PID / process_pattern / artifacts_dir inspection mode
+    if not job_id:
+        if not session:
+            raise ValueError("Provide `job_id` or `session` (with optional `log_path`, `pid`, `process_pattern`, `artifacts_dir`)")
+        if not (log_path or pid_arg is not None or process_pattern or artifacts_dir):
+            raise ValueError("No tracked job found for session; pass `job_id`, `log_path`, `pid`, `process_pattern`, or `artifacts_dir`")
+
+        inspect_py = (
+            "import json, os, subprocess, time\n"
+            f"log_path = {log_path!r}\n"
+            f"tail_n = {tail_lines!r}\n"
+            f"pid_arg = {int(pid_arg) if pid_arg is not None else None!r}\n"
+            f"pat = {process_pattern!r}\n"
+            f"art_dir = {artifacts_dir!r}\n"
+            "out = {'matched_processes': [], 'artifacts': [], 'tail_lines': []}\n"
+            "self_pids = {os.getpid(), os.getppid()}\n"
+            "for entry in os.listdir('/proc'):\n"
+            "    if not entry.isdigit(): continue\n"
+            "    p = int(entry)\n"
+            "    if p in self_pids or p <= 1: continue\n"
+            "    try:\n"
+            "        cmd = open(f'/proc/{p}/cmdline', 'rb').read().replace(b'\\x00', b' ').decode('utf-8', 'replace').strip()\n"
+            "    except Exception:\n"
+            "        continue\n"
+            "    if not cmd or 'colab_pilot' in cmd: continue\n"
+            "    hit = (pid_arg is not None and p == pid_arg) or (pat and pat in cmd)\n"
+            "    if hit:\n"
+            "        rss_mb = None\n"
+            "        try:\n"
+            "            for ln in open(f'/proc/{p}/status', encoding='utf-8'):\n"
+            "                if ln.startswith('VmRSS:'):\n"
+            "                    rss_mb = round(int(ln.split()[1]) / 1024.0, 1)\n"
+            "                    break\n"
+            "        except Exception: pass\n"
+            "        out['matched_processes'].append({'pid': p, 'cmdline': cmd[:240], 'rss_mb': rss_mb})\n"
+            "if log_path and os.path.isfile(log_path):\n"
+            "    st = os.stat(log_path)\n"
+            "    out['log_size_bytes'] = st.st_size\n"
+            "    out['log_mtime'] = st.st_mtime\n"
+            "    with open(log_path, 'rb') as f:\n"
+            "        if st.st_size > 262144: f.seek(-262144, os.SEEK_END)\n"
+            "        txt = f.read().decode('utf-8', 'replace').replace('\\r', '\\n')\n"
+            "    lines = txt.splitlines()\n"
+            "    out['tail_lines'] = lines[-tail_n:] if tail_n > 0 else []\n"
+            "elif log_path:\n"
+            "    out['log_missing'] = True\n"
+            "if art_dir and os.path.isdir(art_dir):\n"
+            "    items = []\n"
+            "    for fn in os.listdir(art_dir):\n"
+            "        fp = os.path.join(art_dir, fn)\n"
+            "        if os.path.isfile(fp):\n"
+            "            st = os.stat(fp)\n"
+            "            items.append({'name': fn, 'path': fp, 'size_bytes': st.st_size, 'mtime': st.st_mtime})\n"
+            "    items.sort(key=lambda x: x['mtime'], reverse=True)\n"
+            "    out['artifacts'] = items[:50]\n"
+            "try:\n"
+            "    r = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total', '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=4)\n"
+            "    if r.returncode == 0 and r.stdout.strip():\n"
+            "        u, used, tot = [x.strip() for x in r.stdout.strip().splitlines()[0].split(',')]\n"
+            "        out['gpu_util'] = f'{u}%'\n"
+            "        out['vram_used'] = f'{round(float(used)/1024, 1)}/{round(float(tot)/1024, 1)} GB'\n"
+            "except Exception: pass\n"
+            "print('POLL_ADHOC_JSON:' + json.dumps(out))\n"
+        )
+        res, _ = _run_remote_python(session, inspect_py, timeout=25)
+        if res.returncode != 0:
+            out = {"session": session, "state": "vm_unreachable", "detail": (res.stderr or res.stdout).strip()[:240]}
+            return {"content": [{"type": "text", "text": json.dumps(out, indent=2)}], "structuredContent": out}
+        parsed: dict[str, Any] = {}
+        for ln in (res.stdout or "").splitlines():
+            if ln.startswith("POLL_ADHOC_JSON:"):
+                parsed = json.loads(ln.split("POLL_ADHOC_JSON:", 1)[1])
+                break
+        parsed["session"] = session
+        parsed["mode"] = "adhoc"
+        parsed["log_path"] = log_path or None
+        parsed["state"] = "running" if parsed.get("matched_processes") else "idle"
+        parsed["tail_line"] = parsed["tail_lines"][-1] if parsed.get("tail_lines") else ""
+        telem = _fetch_session_telemetry(session)
+        if telem:
+            parsed["telemetry"] = telem
+        return {"content": [{"type": "text", "text": json.dumps(parsed, indent=2)}], "structuredContent": parsed}
 
     if not session:
         jobs = _read_json(data_dir / "detached_jobs.json", {})
@@ -1734,6 +2374,9 @@ def tool_colab_poll_job(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
         st_obj["session"] = session
         st_obj["tail_lines"] = tail
         st_obj["tail_line"] = tail[-1] if tail else ""
+        telem = _fetch_session_telemetry(session)
+        if telem:
+            st_obj["telemetry"] = telem
 
         jobs = _read_json(data_dir / "detached_jobs.json", {})
         if isinstance(jobs, dict) and job_id in jobs:
@@ -1766,6 +2409,110 @@ def tool_colab_poll_job(data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": json.dumps(st_obj, indent=2)}], "structuredContent": st_obj}
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def tool_colab_exec(_data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
+    session = str(args["session"]).strip()
+    command = str(args.get("command") or "").strip()
+    python_code = str(args.get("python_code") or "")
+    cwd = str(args.get("cwd") or "").strip()
+    extra_env = {str(k): str(v) for k, v in (args.get("env") or {}).items()}
+    kill_pids = [int(p) for p in (args.get("kill_pids") or [])]
+    kill_pattern = str(args.get("kill_pattern") or "").strip()
+    clean_globs = [str(g) for g in (args.get("clean_globs") or [])]
+    runner = str(args.get("runner") or "auto").strip().lower()
+    timeout_sec = min(120.0, max(2.0, float(args.get("timeout_seconds", 60.0) or 60.0)))
+
+    if not any([command, python_code.strip(), kill_pids, kill_pattern, clean_globs]):
+        raise ValueError("Provide at least one of `command`, `python_code`, `kill_pids`, `kill_pattern`, or `clean_globs`")
+
+    exec_py = (
+        "import glob, json, os, signal, subprocess, sys, time\n"
+        f"cmd = {command!r}\n"
+        f"py_code = {python_code!r}\n"
+        f"work_cwd = {cwd!r} or None\n"
+        f"extra_env = {extra_env!r}\n"
+        f"kill_pids = {kill_pids!r}\n"
+        f"kill_pattern = {kill_pattern!r}\n"
+        f"clean_globs = {clean_globs!r}\n"
+        "self_pids = {os.getpid(), os.getppid()}\n"
+        "killed = []\n"
+        "for pid in kill_pids:\n"
+        "    if pid not in self_pids:\n"
+        "        try:\n"
+        "            os.kill(pid, signal.SIGKILL)\n"
+        "            killed.append(pid)\n"
+        "        except ProcessLookupError: pass\n"
+        "if kill_pattern:\n"
+        "    for entry in os.listdir('/proc'):\n"
+        "        if not entry.isdigit(): continue\n"
+        "        pid = int(entry)\n"
+        "        if pid in self_pids or pid <= 1: continue\n"
+        "        try:\n"
+        "            raw = open(f'/proc/{pid}/cmdline', 'rb').read().replace(b'\\x00', b' ').decode('utf-8', 'replace')\n"
+        "        except Exception: continue\n"
+        "        if kill_pattern in raw and 'colab_pilot' not in raw and 'jupyter' not in raw:\n"
+        "            try:\n"
+        "                os.kill(pid, signal.SIGKILL)\n"
+        "                killed.append(pid)\n"
+        "            except ProcessLookupError: pass\n"
+        "if killed: time.sleep(0.3)\n"
+        "cleaned = []\n"
+        "for g in clean_globs:\n"
+        "    for fp in glob.glob(g):\n"
+        "        try:\n"
+        "            if os.path.isfile(fp) or os.path.islink(fp):\n"
+        "                os.unlink(fp); cleaned.append(fp)\n"
+        "        except OSError: pass\n"
+        "env = os.environ.copy()\n"
+        "env['PYTHONUNBUFFERED'] = '1'\n"
+        "env.update(extra_env)\n"
+        "rc, out_s, err_s = 0, '', ''\n"
+        "if py_code.strip():\n"
+        "    r = subprocess.run([sys.executable, '-B', '-u', '-c', py_code], cwd=work_cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True)\n"
+        "    rc, out_s, err_s = r.returncode, r.stdout, r.stderr\n"
+        "elif cmd:\n"
+        "    r = subprocess.run(['bash', '-lc', cmd], cwd=work_cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True)\n"
+        "    rc, out_s, err_s = r.returncode, r.stdout, r.stderr\n"
+        "print('EXEC_META_JSON:' + json.dumps({'exit_code': rc, 'killed_pids': killed, 'cleaned_files': cleaned, 'stdout': out_s[-16384:], 'stderr': err_s[-8192:]}))\n"
+    )
+
+    t0 = time.monotonic()
+    prefer_ssh = runner == "ssh"
+    try:
+        if runner == "kernel":
+            res = subprocess.run(
+                [_resolve_colab_bin(), "exec", "-s", session],
+                input=exec_py,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+            runner_used = "kernel"
+        else:
+            res, runner_used = _run_remote_python(session, exec_py, timeout=timeout_sec, prefer_ssh=prefer_ssh)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Command timed out after {timeout_sec:.0f}s on {session}; use colab_launch_detached for long jobs."
+        )
+
+    elapsed = round(time.monotonic() - t0, 2)
+    meta: dict[str, Any] = {}
+    for ln in (res.stdout or "").splitlines():
+        if ln.startswith("EXEC_META_JSON:"):
+            meta = json.loads(ln.split("EXEC_META_JSON:", 1)[1])
+            break
+    if not meta:
+        meta = {"exit_code": res.returncode, "stdout": (res.stdout or "")[-16384:], "stderr": (res.stderr or "")[-8192:], "killed_pids": [], "cleaned_files": []}
+    out = {
+        "session": session,
+        "runner_used": runner_used,
+        "duration_sec": elapsed,
+        **meta,
+    }
+    if out.get("exit_code", 0) != 0 and res.returncode != 0 and not out.get("stderr"):
+        out["stderr"] = (res.stderr or res.stdout or "").strip()[:2000]
+    return {"content": [{"type": "text", "text": json.dumps(out, indent=2)}], "structuredContent": out}
 
 
 def tool_colab_reset_vram(_data_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
@@ -1927,12 +2674,15 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "colab_allocate_cascade",
-        "description": "Try GPU tiers in priority order (e.g. A100-highmem -> A100 -> G4 -> L4) within a hard <=145s wall-clock budget, skip unsupported accelerators immediately, verify BF16 support, probe VRAM/RAM/NVENC, and return safe DataLoader/crop sizing.",
+        "description": "Try GPU tiers in priority order (e.g. A100-highmem -> A100 -> G4 -> L4, or prefer_gpus + high_mem) within a hard <=145s wall-clock budget, skip unsupported accelerators immediately, verify BF16 support, probe VRAM/RAM/NVENC, and return safe DataLoader/crop sizing.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "session": {"type": "string"},
                 "tiers": {"type": "array", "items": {"type": "string"}, "default": ["A100-highmem", "A100", "G4", "L4"]},
+                "prefer_gpus": {"type": "array", "items": {"type": "string"}},
+                "high_mem": {"type": "boolean", "default": False},
+                "per_tier_timeout_seconds": {"type": "number"},
                 "require_bf16": {"type": "boolean", "default": True},
                 "keep_warm_minutes": {"type": "number", "default": 0},
                 "max_wall_seconds": {"type": "number", "default": 140},
@@ -1958,33 +2708,54 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "colab_smart_transfer",
-        "description": "Transfer files safely between Mac and Colab without Jupyter /api/contents 500 errors or 180s MCP timeouts: <=24 MiB direct, >24 MiB via 0-CU Drive staging (async background job for >100 MiB or async_transfer=true) or 24 MiB chunked upload with SHA-256 verification.",
+        "description": "Transfer single or batch files safely between workstation, Google Drive, and Colab VMs: auto-mkdir before direct upload (<=24 MiB), Drive staging (>24 MiB, async for >100 MiB), batch files sync, remote_glob downloads, and headless drive_to_vm / drive_pull with archive extraction.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "session": {"type": "string"},
-                "direction": {"type": "string", "enum": ["upload", "download"]},
+                "direction": {"type": "string", "enum": ["upload", "download", "drive_to_vm"]},
                 "local_path": {"type": "string"},
                 "remote_path": {"type": "string"},
-                "mode": {"type": "string", "enum": ["auto", "drive_stage", "chunked", "direct"], "default": "auto"},
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "local_path": {"type": "string"},
+                            "remote_path": {"type": "string"},
+                        },
+                        "required": ["local_path", "remote_path"],
+                    },
+                },
+                "remote_glob": {"type": "string"},
+                "mode": {"type": "string", "enum": ["auto", "drive_stage", "drive_pull", "chunked", "direct"], "default": "auto"},
                 "drive_cache_path": {"type": "string", "default": "gdrive_root:Colab Notebooks/colab_pilot_cache"},
+                "drive_source": {"type": "string"},
+                "extract_archives": {"type": "boolean", "default": False},
+                "extract_dir": {"type": "string"},
                 "async_transfer": {"type": "boolean", "default": False},
                 "transfer_id": {"type": "string"},
             },
-            "required": ["direction", "local_path", "remote_path"],
+            "required": ["direction"],
         },
     },
     {
         "name": "colab_launch_detached",
-        "description": "Launch a Python script detached via nohup on a Colab VM with TQDM_MININTERVAL=5, CR->NL log normalization, 10s GPU/VRAM heartbeat JSON, optional incremental Drive checkpoint mirroring (sync_dir + drive_sync_dest), and local runtime keepalive.",
+        "description": "Launch a local or already-staged remote Python script detached via nohup on a Colab VM with cwd, custom log_path mirroring, optional warm-chain kill_existing_pattern/clean_globs, 10s GPU heartbeat JSON, incremental Drive checkpoint mirroring, and local runtime keepalive.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "session": {"type": "string"},
                 "script_path": {"type": "string"},
+                "remote_script_path": {"type": "string"},
+                "cwd": {"type": "string"},
+                "log_path": {"type": "string"},
                 "args": {"type": "array", "items": {"type": "string"}},
                 "env": {"type": "object"},
                 "job_id": {"type": "string"},
+                "kill_existing_pattern": {"type": "string"},
+                "kill_pids": {"type": "array", "items": {"type": "integer"}},
+                "clean_globs": {"type": "array", "items": {"type": "string"}},
                 "auto_stop_vm": {"type": "boolean", "default": False},
                 "sync_dir": {"type": "string"},
                 "drive_sync_dest": {"type": "string"},
@@ -1995,15 +2766,39 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "colab_poll_job",
-        "description": "Poll a detached Colab job (via REST Contents API) or a background drive_stage transfer (transfer_jobs.json) without opening a WebSocket.",
+        "description": "Poll a detached Colab job (status.json + job.log), a background drive_stage/drive_pull transfer, or any ad-hoc process/log_path/artifacts_dir on a Colab VM with live GPU/VRAM/RAM/Disk telemetry.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "session": {"type": "string"},
                 "job_id": {"type": "string"},
+                "log_path": {"type": "string"},
+                "pid": {"type": "integer"},
+                "process_pattern": {"type": "string"},
+                "artifacts_dir": {"type": "string"},
                 "tail_lines": {"type": "integer", "default": 30},
             },
-            "required": ["job_id"],
+        },
+        "_meta": {"ui": {"visibility": ["model", "app"]}},
+    },
+    {
+        "name": "colab_exec",
+        "description": "Execute a bounded (<=120s), non-TTY one-shot shell command or Python snippet on a Colab VM (auto-routing over colab ssh if the Jupyter kernel is busy) with optional safe PID/pattern kill and file glob cleanup.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session": {"type": "string"},
+                "command": {"type": "string"},
+                "python_code": {"type": "string"},
+                "cwd": {"type": "string"},
+                "env": {"type": "object"},
+                "kill_pids": {"type": "array", "items": {"type": "integer"}},
+                "kill_pattern": {"type": "string"},
+                "clean_globs": {"type": "array", "items": {"type": "string"}},
+                "runner": {"type": "string", "enum": ["auto", "ssh", "kernel"], "default": "auto"},
+                "timeout_seconds": {"type": "number", "default": 60},
+            },
+            "required": ["session"],
         },
         "_meta": {"ui": {"visibility": ["model", "app"]}},
     },
@@ -2069,6 +2864,7 @@ TOOL_DISPATCH = {
     "colab_smart_transfer": tool_colab_smart_transfer,
     "colab_launch_detached": tool_colab_launch_detached,
     "colab_poll_job": tool_colab_poll_job,
+    "colab_exec": tool_colab_exec,
     "colab_reset_vram": tool_colab_reset_vram,
     "colab_keep_warm": tool_colab_keep_warm,
     "colab_stop_all": tool_colab_stop_all,
@@ -2104,7 +2900,7 @@ def _handle_request(req: dict[str, Any], data_dir: Path) -> None:
                             "tools": {"listChanged": False},
                             "resources": {"subscribe": False, "listChanged": False},
                         },
-                        "serverInfo": {"name": "colab-pilot", "version": "1.3.2"},
+                        "serverInfo": {"name": "colab-pilot", "version": "1.4.0"},
                     },
                 }
             )

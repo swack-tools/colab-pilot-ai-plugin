@@ -36,7 +36,7 @@ PAGES = {
     ),
     "reference": (
         "Technical reference — Colab Pilot",
-        "Complete reference for all 10 pilot MCP tools, lifecycle hooks, interactive dashboard UI, and release verification.",
+        "Complete reference for all 11 pilot MCP tools, lifecycle hooks, interactive dashboard UI, and release verification.",
     ),
 }
 

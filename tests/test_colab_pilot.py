@@ -69,7 +69,7 @@ else:
 
 class ColabPilotTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(prefix="colab_pilot_test_")
+        self.tmp = tempfile.TemporaryDirectory(prefix="colab_pilot_test_", ignore_cleanup_errors=True)
         self.tmp_path = Path(self.tmp.name)
         self.home_dir = self.tmp_path / "home"
         self.data_dir = self.tmp_path / "data"
@@ -86,6 +86,14 @@ class ColabPilotTests(unittest.TestCase):
         self.env["PYTHONDONTWRITEBYTECODE"] = "1"
 
     def tearDown(self) -> None:
+        ka_file = self.data_dir / "keepalive_daemon.json"
+        if ka_file.is_file():
+            try:
+                pid = int((json.loads(ka_file.read_text(encoding="utf-8")) or {}).get("pid") or 0)
+                if pid > 0:
+                    os.kill(pid, 15)
+            except Exception:
+                pass
         self.tmp.cleanup()
 
     def _run_hook(self, event: str, payload: dict) -> dict:
@@ -178,7 +186,7 @@ class ColabPilotTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         by_id = {m["id"]: m for m in (json.loads(ln) for ln in res.stdout.splitlines() if ln.strip())}
 
-        self.assertEqual(len(by_id[2]["result"]["tools"]), 10)
+        self.assertEqual(len(by_id[2]["result"]["tools"]), 11)
         self.assertEqual(by_id[3]["result"]["contents"][0]["mimeType"], "text/html;profile=mcp-app")
         dash = by_id[4]["result"]["structuredContent"]
         self.assertEqual(dash["usage"]["balance"], 5163.47)
@@ -283,7 +291,7 @@ class ColabPilotTests(unittest.TestCase):
         self.assertEqual(c1, c2)
         self.assertEqual((d1 / "SHA256SUMS").read_text(), (d2 / "SHA256SUMS").read_text())
         self.assertLess((PLUGIN_DIR / "assets" / "dashboard.html").stat().st_size, 256 * 1024)
-        for zname in ("colab-pilot-1.3.2.zip", "colab-pilot-claude.zip", "colab-pilot-codex.zip"):
+        for zname in ("colab-pilot-1.4.0.zip", "colab-pilot-claude.zip", "colab-pilot-codex.zip"):
             with zipfile.ZipFile(d1 / zname) as zf:
                 self.assertIn(".mcp.json", zf.namelist(), f".mcp.json missing in {zname}")
 
@@ -380,7 +388,7 @@ class ColabPilotTests(unittest.TestCase):
     def test_allocate_cascade_wall_clock_budget_and_400_fast_skip(self) -> None:
         mcp = _load_module("colab_mcp_server", SCRIPTS_DIR / "colab_mcp_server.py")
         self.assertLessEqual(mcp.MAX_CASCADE_BUDGET_SEC, 145.0)
-        self.assertLessEqual(mcp.DEFAULT_CASCADE_TIER_TIMEOUT_SEC, 28.0)
+        self.assertLessEqual(mcp.DEFAULT_CASCADE_TIER_TIMEOUT_SEC, 45.0)
 
         fake_colab = self.tmp_path / "cascade_colab"
         fake_colab.write_text(
@@ -708,9 +716,321 @@ elif cmd == "sessions":
             )
             self.assertEqual(res.returncode, 0, f"{mode}: {res.stderr}")
             by_id = {m["id"]: m for m in (json.loads(ln) for ln in res.stdout.splitlines() if ln.strip())}
-            self.assertEqual(by_id[1]["result"]["serverInfo"]["version"], "1.3.2")
+            self.assertEqual(by_id[1]["result"]["serverInfo"]["version"], "1.4.0")
             tool_names = [t["name"] for t in by_id[2]["result"]["tools"]]
             self.assertIn("colab_dashboard", tool_names)
+            self.assertIn("colab_exec", tool_names)
+
+    def test_launch_detached_inline_script_remote_script_cwd_log_and_warm_chain(self) -> None:
+        mcp = _load_module("colab_mcp_server", SCRIPTS_DIR / "colab_mcp_server.py")
+        calls_log = self.tmp_path / "launch_calls.log"
+        captured_inputs: list[str] = []
+        fake_colab = self.tmp_path / "launch_colab"
+        fake_colab.write_text(
+            f"""#!/usr/bin/env python3
+import sys
+args = sys.argv[1:]
+with open({str(calls_log)!r}, "a") as f:
+    f.write(" ".join(args) + "\\n")
+if args and args[0] == "exec":
+    sys.stdin.read()
+    print("DETACHED_PID:43210")
+elif args and args[0] == "upload":
+    sys.stderr.write("SHOULD_NOT_UPLOAD_SMALL_SCRIPT\\n")
+    sys.exit(1)
+""",
+            encoding="utf-8",
+        )
+        fake_colab.chmod(0o755)
+        local_script = self.tmp_path / "train_local.py"
+        local_script.write_text("print('hi')\n", encoding="utf-8")
+
+        old_env = {k: os.environ.get(k) for k in ("HOME", "COLAB_BIN", "COLAB_KEEPALIVE_INTERVAL_SEC")}
+        os.environ["HOME"] = str(self.home_dir)
+        os.environ["COLAB_BIN"] = str(fake_colab)
+        os.environ["COLAB_KEEPALIVE_INTERVAL_SEC"] = "60"
+        try:
+            # 1. Local small script uses inline base64 write after mkdir (zero colab upload 500 error)
+            r1 = mcp.tool_colab_launch_detached(
+                self.data_dir,
+                {"session": "vm1", "script_path": str(local_script), "job_id": "j-local"},
+            )["structuredContent"]
+            self.assertEqual(r1["pid"], 43210)
+            self.assertNotIn("upload ", calls_log.read_text(encoding="utf-8"))
+
+            # 2. Remote /content/work script + cwd + log_path + warm-chain args
+            r2 = mcp.tool_colab_launch_detached(
+                self.data_dir,
+                {
+                    "session": "vm1",
+                    "script_path": "/content/work/scripts/run_v12.py",
+                    "cwd": "/content/work",
+                    "log_path": "/content/out/v12.log",
+                    "kill_existing_pattern": "run_v11.py",
+                    "clean_globs": ["/content/out/*.tmp"],
+                    "job_id": "j-remote",
+                },
+            )["structuredContent"]
+            self.assertEqual(r2["remote_script"], "/content/work/scripts/run_v12.py")
+            self.assertEqual(r2["cwd"], "/content/work")
+            self.assertEqual(r2["log_path"], "/content/out/v12.log")
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_poll_job_adhoc_log_process_and_artifacts(self) -> None:
+        mcp = _load_module("colab_mcp_server", SCRIPTS_DIR / "colab_mcp_server.py")
+        fake_colab = self.tmp_path / "poll_adhoc_colab"
+        fake_colab.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            "if args and args[0] == 'exec':\n"
+            "    _ = sys.stdin.read()\n"
+            "    payload = {\n"
+            "        'matched_processes': [{'pid': 999, 'cmdline': 'python3 train.py', 'rss_mb': 2048.0}],\n"
+            "        'artifacts': [{'name': 'ckpt.pt', 'path': '/content/out/ckpt.pt', 'size_bytes': 1234, 'mtime': 1700000000.0}],\n"
+            "        'tail_lines': ['epoch 1', 'epoch 2'],\n"
+            "        'log_size_bytes': 120,\n"
+            "        'gpu_util': '91%',\n"
+            "        'vram_used': '40.0/80.0 GB',\n"
+            "    }\n"
+            "    print('POLL_ADHOC_JSON:' + json.dumps(payload))\n",
+            encoding="utf-8",
+        )
+        fake_colab.chmod(0o755)
+        old_env = {k: os.environ.get(k) for k in ("HOME", "COLAB_BIN")}
+        os.environ["HOME"] = str(self.home_dir)
+        os.environ["COLAB_BIN"] = str(fake_colab)
+        try:
+            res = mcp.tool_colab_poll_job(
+                self.data_dir,
+                {
+                    "session": "vm-adhoc",
+                    "log_path": "/content/out/train.log",
+                    "process_pattern": "train.py",
+                    "artifacts_dir": "/content/out",
+                },
+            )["structuredContent"]
+            self.assertEqual(res["mode"], "adhoc")
+            self.assertEqual(res["state"], "running")
+            self.assertEqual(res["tail_line"], "epoch 2")
+            self.assertEqual(len(res["artifacts"]), 1)
+            self.assertEqual(res["gpu_util"], "91%")
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_allocate_cascade_prefer_gpus_high_mem_and_tier_timeout(self) -> None:
+        mcp = _load_module("colab_mcp_server", SCRIPTS_DIR / "colab_mcp_server.py")
+        calls_log = self.tmp_path / "cascade_hm_calls.log"
+        fake_colab = self.tmp_path / "cascade_hm_colab"
+        fake_colab.write_text(
+            f"""#!/usr/bin/env python3
+import sys
+args = sys.argv[1:]
+with open({str(calls_log)!r}, "a") as f:
+    f.write(" ".join(args) + "\\n")
+if args and args[0] == "new":
+    if "A100" in args:
+        sys.stderr.write("503\\n")
+        sys.exit(1)
+    print("READY")
+elif args and args[0] == "exec":
+    print('PROBE_JSON:{{"cpu_count": 12, "gpu_name": "NVIDIA L4", "vram_gb": 22.5, "bf16_supported": true, "sys_ram_gb": 53.0, "hevc_nvenc": true}}')
+""",
+            encoding="utf-8",
+        )
+        fake_colab.chmod(0o755)
+        old_env = {k: os.environ.get(k) for k in ("HOME", "COLAB_BIN")}
+        os.environ["HOME"] = str(self.home_dir)
+        os.environ["COLAB_BIN"] = str(fake_colab)
+        try:
+            out = mcp.tool_colab_allocate_cascade(
+                self.data_dir,
+                {
+                    "session": "hm-vm",
+                    "prefer_gpus": ["A100", "L4"],
+                    "high_mem": True,
+                    "per_tier_timeout_seconds": 5.0,
+                },
+            )["structuredContent"]
+            self.assertEqual(out["assigned_tier"], "L4-highmem")
+            logged = calls_log.read_text(encoding="utf-8")
+            self.assertIn("new -s hm-vm --gpu A100 --high-mem", logged)
+            self.assertIn("new -s hm-vm --gpu L4 --high-mem", logged)
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_smart_transfer_mkdir_batch_files_glob_download_and_drive_pull(self) -> None:
+        mcp = _load_module("colab_mcp_server", SCRIPTS_DIR / "colab_mcp_server.py")
+        rclone_conf = self.home_dir / ".config" / "rclone" / "colab_gdrive_root.conf"
+        rclone_conf.parent.mkdir(parents=True, exist_ok=True)
+        rclone_conf.write_text("[gdrive_root]\ntype = drive\n", encoding="utf-8")
+
+        calls_log = self.tmp_path / "xfer_calls.log"
+        fake_colab = self.tmp_path / "xfer_colab"
+        fake_colab.write_text(
+            f"""#!/usr/bin/env python3
+import sys
+args = sys.argv[1:]
+with open({str(calls_log)!r}, "a") as f:
+    f.write(" ".join(args) + "\\n")
+if args and args[0] == "exec":
+    body = sys.stdin.read()
+    if "GLOB_JSON:" in body:
+        print('GLOB_JSON:["/content/out/a.pt", "/content/out/b.pt"]')
+    elif "DRIVE_PULL_JSON:" in body:
+        print('DRIVE_PULL_JSON:{{"files": 2, "extracted": ["/content/work/bundle.tar"]}}')
+    else:
+        print("OK")
+elif args and args[0] == "download":
+    with open(args[-1], "wb") as f:
+        f.write(b"ckpt")
+""",
+            encoding="utf-8",
+        )
+        fake_colab.chmod(0o755)
+        f1 = self.tmp_path / "m1.py"
+        f2 = self.tmp_path / "m2.py"
+        f1.write_text("x=1\n", encoding="utf-8")
+        f2.write_text("y=2\n", encoding="utf-8")
+        dl_dir = self.tmp_path / "weights"
+
+        old_env = {k: os.environ.get(k) for k in ("HOME", "COLAB_BIN")}
+        os.environ["HOME"] = str(self.home_dir)
+        os.environ["COLAB_BIN"] = str(fake_colab)
+        try:
+            up = mcp.tool_colab_smart_transfer(
+                self.data_dir,
+                {
+                    "session": "vm-x",
+                    "direction": "upload",
+                    "files": [
+                        {"local_path": str(f1), "remote_path": "/content/work/pkg/m1.py"},
+                        {"local_path": str(f2), "remote_path": "/content/work/pkg/m2.py"},
+                    ],
+                },
+            )["structuredContent"]
+            self.assertEqual(up["mode"], "batch")
+            self.assertEqual(up["count"], 2)
+
+            dl = mcp.tool_colab_smart_transfer(
+                self.data_dir,
+                {
+                    "session": "vm-x",
+                    "direction": "download",
+                    "remote_glob": "/content/out/*.pt",
+                    "local_path": str(dl_dir),
+                },
+            )["structuredContent"]
+            self.assertEqual(dl["mode"], "glob")
+            self.assertEqual(dl["count"], 2)
+            self.assertTrue((dl_dir / "a.pt").is_file())
+
+            pull = mcp.tool_colab_smart_transfer(
+                self.data_dir,
+                {
+                    "session": "vm-x",
+                    "direction": "drive_to_vm",
+                    "mode": "drive_pull",
+                    "drive_source": "gdrive_root:Colab Notebooks/bundle",
+                    "remote_path": "/content/work",
+                    "extract_archives": True,
+                },
+            )["structuredContent"]
+            self.assertEqual(pull["state"], "completed")
+            self.assertEqual(pull["extracted"], ["/content/work/bundle.tar"])
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_colab_exec_python_shell_and_busy_kernel_ssh_routing(self) -> None:
+        mcp = _load_module("colab_mcp_server", SCRIPTS_DIR / "colab_mcp_server.py")
+        calls_log = self.tmp_path / "exec_calls.log"
+        fake_colab = self.tmp_path / "exec_colab"
+        fake_colab.write_text(
+            f"""#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+with open({str(calls_log)!r}, "a") as f:
+    f.write(" ".join(args) + "\\n")
+if args and args[0] == "ssh":
+    print('EXEC_META_JSON:' + json.dumps({{"exit_code": 0, "killed_pids": [], "cleaned_files": [], "stdout": "from-ssh\\n", "stderr": ""}}))
+elif args and args[0] == "exec":
+    _ = sys.stdin.read()
+    print('EXEC_META_JSON:' + json.dumps({{"exit_code": 0, "killed_pids": [], "cleaned_files": ["/content/out/old.tmp"], "stdout": "from-kernel\\n", "stderr": ""}}))
+""",
+            encoding="utf-8",
+        )
+        fake_colab.chmod(0o755)
+        sess_file = self.home_dir / ".config" / "colab-cli" / "sessions.json"
+        sess_file.parent.mkdir(parents=True, exist_ok=True)
+        sess_file.write_text(
+            json.dumps(
+                {
+                    "busy-vm": {"name": "busy-vm", "running": "cell-1"},
+                    "idle-vm": {"name": "idle-vm", "running": None},
+                }
+            ),
+            encoding="utf-8",
+        )
+        old_env = {k: os.environ.get(k) for k in ("HOME", "COLAB_BIN")}
+        os.environ["HOME"] = str(self.home_dir)
+        os.environ["COLAB_BIN"] = str(fake_colab)
+        try:
+            r_ssh = mcp.tool_colab_exec(self.data_dir, {"session": "busy-vm", "command": "nvidia-smi"})["structuredContent"]
+            self.assertEqual(r_ssh["runner_used"], "ssh")
+            self.assertIn("from-ssh", r_ssh["stdout"])
+
+            r_kern = mcp.tool_colab_exec(
+                self.data_dir,
+                {"session": "idle-vm", "python_code": "print('ok')", "clean_globs": ["/content/out/*.tmp"]},
+            )["structuredContent"]
+            self.assertEqual(r_kern["runner_used"], "kernel")
+            self.assertEqual(r_kern["cleaned_files"], ["/content/out/old.tmp"])
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_dashboard_text_summary_includes_session_telemetry(self) -> None:
+        mcp = _load_module("colab_mcp_server", SCRIPTS_DIR / "colab_mcp_server.py")
+        mcp._RESOURCES_MEM_CACHE.clear()
+        sess_file = self.home_dir / ".config" / "colab-cli" / "sessions.json"
+        sess_file.parent.mkdir(parents=True, exist_ok=True)
+        sess_file.write_text(json.dumps({"test-vm": {"name": "test-vm", "accelerator": "A100", "machine_shape": "HIGH_MEM"}}), encoding="utf-8")
+        mcp._write_json(self.data_dir / "vm_telemetry.json", {"test-vm": {"cpu_pct": 18.2, "cpu_count": 12, "load_1m": 0.5, "sampled_at": time.time(), "source": "keepalive"}})
+        old_env = {k: os.environ.get(k) for k in ("HOME", "COLAB_BIN")}
+        os.environ["HOME"] = str(self.home_dir)
+        os.environ["COLAB_BIN"] = str(self.mock_colab)
+        try:
+            res = mcp.tool_colab_dashboard(self.data_dir, {})
+            text = res["content"][0]["text"]
+            self.assertIn("[test-vm]", text)
+            self.assertIn("A100", text)
+            self.assertIn("CPU 18.2%", text)
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 if __name__ == "__main__":
